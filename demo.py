@@ -2111,137 +2111,35 @@ def rrf_fuse_ranks(seq_scores, wire_dists, c=60):
     return 1.0 / (c + r_seq.astype(np.float32)) + 1.0 / (c + r_wire.astype(np.float32))
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Simplified seq+wire demo")
     parser.add_argument('--query_json', type=Path, required=True)
     parser.add_argument('--candidate_json', type=Path, required=True)
     parser.add_argument('--query_root', type=Path, required=True, help="absolute folder for query images")
     parser.add_argument('--candidate_root', type=Path, required=True, help="absolute folder for candidate images")
-    parser.add_argument('--top_k', type=int, default=50)
     parser.add_argument('--output_json', type=Path, default=Path('Retrieval_results.json'))
-    parser.add_argument('--vis_folder', type=Path, default=Path('retrieval_vis'))
-    # parser.add_argument("--keywords", nargs="+", default=["Hallway_6", "Room_6"])
-    parser.add_argument("--keywords", nargs="+", default=[])
-# --- Wireframe options ---
-    parser.add_argument('--wire_mode', choices=['off', 'coarse', 'post'], default='off',
-                        help="off: only coarse+ged; coarse: fuse wf in coarse + GED; post: use WF for reranking after GED")
-    parser.add_argument('--wire_query_json', type=Path, default=None,
-                        help="wireframe JSON for queries (same format as your wireframe code)")
-    parser.add_argument('--wire_candidate_json', type=Path, default=None,
-                        help="wireframe JSON for candidates (same format as your wireframe code)")
-    parser.add_argument('--wire_target_hw', nargs=2, type=int, metavar=('H','W'), default=None,
-                        help="target resize for wireframe feature (H W). If None, try to infer from data.")
-    parser.add_argument('--wire_grid', nargs=2, type=int, metavar=('rows','cols'), default=[4, 4],
-                        help="wireframe grid size")
-    parser.add_argument('--wire_score_th', type=float, default=0.75,
-                        help="score threshold for lines_score")
-    parser.add_argument('--wire_bins', type=int, default=16,
-                        help="orientation bins in [0,180)")
-    parser.add_argument('--wire_tau', type=float, default=0.0,
-                        help="chi2->sim decay; if <=0, auto-calibrate per query")
-    parser.add_argument('--wire_weight', type=float, default=0.5,
-                        help="weight of wireframe similarity in fusion")
-    parser.add_argument('--post_cost_weight', type=float, default=1.0,
-                        help="only for wire_mode=post: weight for cost-derived similarity")
-
-    parser.add_argument("--viz_flag", type=str, default=None,
-                    choices=["node","edge","coarse","GED","Wireframe", "seq_wire"],
-                    help="選擇要輸出的排名階段")
-    parser.add_argument("--out_root", type=str, default="./viz",
-                        help="視覺化與結果輸出的根資料夾")
-    parser.add_argument("--use_mask", action="store_true", default=False,
-                        help="節點/邊相似度是否啟用動態遮罩（預設 False=完整向量）")
-    parser.add_argument("--ged_pool", type=int, default=200,
-                        help="GED 模式的候選池大小")
-    parser.add_argument("--ged_pool_source", type=str, default="coarse",
-                        choices=["coarse","node","edge"],
-                        help="從哪個粗排來源擷取 GED 候選池")
-    parser.add_argument("--viz_node_mode", type=str, default="both",
-                    choices=["full","masked","both"],
-                    help="在拼圖上顯示 node 向量：full / masked / both（預設 both）")
-    
-    parser.add_argument("--viz_label_classes", action="store_true",
-                    help="在條帶上方標註每個 node 類別名稱（預設關閉）")
-    parser.add_argument("--viz_cols", type=int, default=None,
-                        help="每頁欄數：10=1×10，5=1×5；未指定時，若有標籤則用5，否則用10")
-    parser.add_argument("--viz_cell_w", type=int, default=None,
-                        help="每格圖寬(像素)覆寫；未指定時，自動：有標籤→更寬(≈2:1)，無標籤→4:3")
-    parser.add_argument("--viz_label_max_chars", type=int, default=8,
-                        help="每個類別名稱的最長字元（過長會截斷）")
-    parser.add_argument("--viz_node_print_values", action="store_true",
-                    help="在拼圖中印出 node 向量的數值（取代條帶）。")
-    parser.add_argument("--viz_node_decimals", type=int, default=3,
-                        help="向量數值的小數位數（預設 3）。")
-    parser.add_argument("--node_vec_mode", type=str, choices=["counts", "descriptor", "layout", "attr", "seq"], default="counts",
-        help="counts=9維類別計數；descriptor=原 descriptor；layout=2x2xC 佈局向量（用 chi2→exp(-d/τ) 排名）")
-    parser.add_argument("--viz_display_counts", action="store_true",
-                    help="在視覺化中顯示未正規化的 node class 計數（Query 與 Candidate）。")
-    parser.add_argument("--class_order_override", type=str, default="",
-                        help="以逗號分隔的 class 順序（留空則用預設順序）。")
-    # node 相似度/距離度量：cosine 或 chi2
-    parser.add_argument("--node_metric", type=str, default="chi2",
-                        choices=["cosine", "chi2", "lcs_xy"],
-                        help="node 比分方式；counts-only 建議用 chi2")
-    # chi2 相關選項
-    parser.add_argument("--node_chi2_mask", action="store_true",
-                        help="Chi-square 僅在 query 計數>0 的類別上計算")
-    parser.add_argument("--node_chi2_tau", type=float, default=25.0,
-                        help=">0 時將距離轉成相似度：score=exp(-d/tau)；預設 0 用 score=-distance")
-    parser.add_argument(
-        "--two_stage_layout_rerank", action="store_true",
-        help="先用 node counts 取 Top-K，再用 layout 分數在這 K 個裡重排"
-    )
-    parser.add_argument(
-        "--two_stage_k", type=int, default=50,
-        help="第一階段用 node counts 取出的候選數（預設 50）"
-    )
-    # ---- overlay 2D nodes text on tiles ----
-    parser.add_argument("--viz_overlay_nodes_2d", action="store_true",
-        help="在每個 tile 上以 3D→2D 投影標出 node 類別文字與小圓點")
-    parser.add_argument("--proj_intrin_query", type=str, choices=["real","syn","auto"],
-        default="real", help="Query 投影內參；已為你預設 real")
-    parser.add_argument("--proj_intrin_cand", type=str, choices=["real","syn","auto"],
-        default="syn", help="Candidate 投影內參；已為你預設 syn")
-    parser.add_argument("--viz_overlay_fontscale", type=float, default=0.0,
-        help="文字大小比例；0=自動依 tile 寬度估")
-    
-    parser.add_argument("--pc_iou", action="store_true",
-        help="計算 query 與 candidate 點雲的 IoU，並顯示在每個 candidate 的 score 下方")
-    parser.add_argument("--pc_dist_th", type=float, default=10.0,
-        help="點雲比對的距離閾值（與 compute_pc_iou_for_pair 的 distance_threshold 相同）")
-    parser.add_argument("--pc_query_root", type=str, default=None,
-        help="query 點雲根目錄；若為空則嘗試與影像同資料夾同名 .npz/.ply")
-    parser.add_argument("--pc_candidate_root", type=str, default=None,
-        help="candidate 點雲根目錄；若為空則嘗試與影像同資料夾同名 .npz/.ply")
-    parser.add_argument("--pc_voxel_size", type=float, default=0.05,
-        help="voxel 大小（公尺）。IoU 以 voxel 佔用集合做計算")
-    parser.add_argument("--pc_iou_th", type=float, default=0.5,
-        help="統計指標時 IoU 的閾值（預設 0.5）")
-    parser.add_argument("--mi_json", type=Path, default=None,
-                    help="Mapping JSON: query → ref_image（只顯示比較，不參與排名）")
-    parser.add_argument("--debug_q_overlay", action="store_true",
-                    help="Dump query overlay used for header and compose debug header.")
-                    
-    parser.add_argument("--coarse_output", type=Path, default=None,
-                    help="MI-style JSON output: {'results': {query_img: [{'ref_image': cand_img}, ...]}}")
-
-
-    # --- Fusion options ---
-    parser.add_argument('--fusion', choices=['score', 'rrf'], default='score',
-                        help='Fusion strategy when viz_flag=seq_wire')
-    parser.add_argument('--w_seq', type=float, default=0.5, help='Weight for Node Sequence (score-level)')
-    parser.add_argument('--w_wire', type=float, default=0.5, help='Weight for Wireframe (score-level)')
-    parser.add_argument('--tau', type=float, default=0.0, 
-                        help='Chi-square temperature; 0 means auto per-query (median distance)')
-    parser.add_argument('--q_low', type=float, default=0.05, help='Lower quantile for robust scaling')
-    parser.add_argument('--q_high', type=float, default=0.95, help='Upper quantile for robust scaling')
-    parser.add_argument('--rrf_c', type=int, default=60, help='RRF constant c for rank-level fusion')
-
+    parser.add_argument('--out_root', type=Path, default=Path('./viz'), help='root folder for visualization/results')
+    parser.add_argument('--keywords', nargs='+', default=[])
+    parser.add_argument('--wire_query_json', type=Path, default=None, help='wireframe JSON for queries')
+    parser.add_argument('--wire_candidate_json', type=Path, default=None, help='wireframe JSON for candidates')
+    parser.add_argument('--wire_target_hw', nargs=2, type=int, metavar=('H','W'), default=None)
+    parser.add_argument('--wire_grid', nargs=2, type=int, metavar=('rows','cols'), default=[4, 4])
+    parser.add_argument('--wire_score_th', type=float, default=0.75)
+    parser.add_argument('--wire_bins', type=int, default=16)
+    parser.add_argument('--top_k', type=int, default=50)
+    parser.add_argument('--fusion', choices=['score', 'rrf'], default='rrf')
+    parser.add_argument('--w_seq', type=float, default=0.5)
+    parser.add_argument('--w_wire', type=float, default=0.5)
+    parser.add_argument('--tau', type=float, default=0.0)
+    parser.add_argument('--q_low', type=float, default=0.05)
+    parser.add_argument('--q_high', type=float, default=0.95)
+    parser.add_argument('--rrf_c', type=int, default=60)
+    parser.add_argument('--coarse_output', type=Path, default=None,
+                        help="MI-style JSON output: {'results': {query_img: [{'ref_image': cand_img}, ...]}}")
     args = parser.parse_args()
 
     q_names, q_graphs, q_descs = load_graphs(args.query_json)
     c_names, c_graphs, c_descs = load_graphs(args.candidate_json)
 
-    # --- 載入 candidates 後，馬上做 keyword 過濾 ---
     if args.keywords:
         keep = []
         for name, g, d in zip(c_names, c_graphs, c_descs):
@@ -2254,765 +2152,128 @@ def main():
         c_descs = np.stack(c_descs, axis=0).astype(np.float32)
         print(f"[i] Filtered candidates down to {len(c_names)} using keywords {args.keywords}")
 
-    # --- 在進入視覺化之前，印出候選集數量 ---
-    print(f"[i] Number of candidates after filtering: {len(c_names)}")
-    cand_base2idx = { _canon_name(name): i for i, name in enumerate(c_names) }
-    for i, name in enumerate(c_names):
-        cand_base2idx[_canon_name(Path(name).name)] = i
-
-    # === 準備 layout 向量（2x2×9），供 coarse 與視覺化 ===
-    q_layout_mat = build_layout_counts_batch(q_graphs, STRUCTURAL_CLASSES, LAYOUT_ROWS, LAYOUT_COLS, intrinsics="real")  # (Nq, 2*2*9)
-    print(q_layout_mat)
-    c_layout_mat = build_layout_counts_batch(c_graphs, STRUCTURAL_CLASSES, LAYOUT_ROWS, LAYOUT_COLS, intrinsics="syn")  # (Nc, 2*2*9)
-
-
-    # 依 override 或預設建立顯示順序
-    if args.class_order_override.strip():
-        class_order = [s.strip() for s in args.class_order_override.split(",") if s.strip()]
-    else:
-        class_order = list(STRUCTURAL_CLASSES)
-
-    # 名稱→索引（全名與 basename 雙保險）
-    name2idx_for_counts = {name: i for i, name in enumerate(c_names)}
-    for i, name in enumerate(c_names):
-        name2idx_for_counts[Path(name).name] = i
-
-    # 依旗標決定 node 矩陣
-    # class_order = DEFAULT_COUNTS_CLASS_ORDER  # 或 list(STRUCTURAL_CLASSES)
-    q_node_mat, c_node_mat, node_len_mode = get_node_mats_by_mode(
-        q_descs, c_descs, q_graphs, c_graphs, mode=args.node_vec_mode, class_order=class_order
-    )
-    node_len = 64
-
-    # 供視覺化顯示（node 向量值）使用
-    cand_name2idx = {name: i for i, name in enumerate(c_names)}
-    for i, name in enumerate(c_names):
-        cand_name2idx[Path(name).name] = i
-
-    q_paths = [str(args.query_root / n) for n in q_names]
-    c_paths = [str(args.candidate_root / n) for n in c_names]
-
-    
-
-    # ===== 可視化五模式：若指定 viz_flag 就執行並 return =====
-    if args.viz_flag is not None:
-        flag = args.viz_flag
-        out_dir = Path(args.out_root) / flag.lower()
-        out_collage = out_dir / "collages"
-        out_json = out_dir / f"results_{flag.lower()}.json"
-        out_csv  = out_dir / f"results_{flag.lower()}.csv"
-        os.makedirs(out_collage, exist_ok=True)
-
-        # 準備影像路徑（視覺化用）
-        q_name2img = name2imgpath_from_graphs(q_names, q_graphs)
-        c_name2img = name2imgpath_from_graphs(c_names, c_graphs)
-
-        # 若使用 wireframe 模式，確保 wire 特徵已建好（沿用你原本的 build 函式與參數）
-        wire_db_mat = None
-        wire_db_name2idx = None
-        wire_q_dict = None
-        if flag == "Wireframe" or flag == "seq_wire":
-            # 需預先以你的參數構建 wire 資料庫與 query 字典
-            # 假設你原本參數名：args.wire_db_json, args.wire_q_json, args.wire_H/W/rows/cols/score_th/num_bins
-            if args.wire_candidate_json and args.wire_query_json:
-                db_entries = load_wire_json(Path(args.wire_candidate_json))
-                q_entries  = load_wire_json(Path(args.wire_query_json))
-
-                # pick target size
-                if args.wire_target_hw is not None:
-                    H, W = map(int, args.wire_target_hw)
-                else:
-                    # try to infer from first query entry, fallback to (480,640)
-                    if len(q_entries) > 0:
-                        H = int(q_entries[0].get("height", 1080))
-                        W = int(q_entries[0].get("width",  1920))
-                    else:
-                        H, W = 1080, 1920
-
-                rows, cols   = map(int, args.wire_grid)
-                score_th     = float(args.wire_score_th)
-                num_bins     = int(args.wire_bins)
-
-                # filter to current SG names (by basename)
-                q_basenames = {Path(p).name for p in q_paths}
-                c_basenames = {Path(p).name for p in c_paths}
-
-
-                wire_db_mat, wire_db_name2idx = build_wire_db_from_json(
-                    db_entries, H, W, rows, cols,
-                    score_th, num_bins, keep_basenames=c_basenames
-                )
-                wire_q_dict = build_wire_q_from_json(
-                    q_entries, H, W, rows, cols,
-                    score_th, num_bins, keep_basenames=q_basenames
-                )
-
-        # 依旗標執行
-        TOPK = 50
-        results = {}
-        mi_map = load_mi_map(args.mi_json) if args.mi_json else {}
-        args._ref_map = mi_map
-
-        for qi, qn in enumerate(q_names):
-            q_desc = q_descs[qi]
-            q_img  = q_name2img.get(qn, qn)
-            q_node_vec = (q_node_mat[qi] if q_node_mat is not None else None)
-            q_layout_vec = q_layout_mat[qi]
-
-            if flag == "node":
-                if args.node_vec_mode=="counts" and args.node_metric=="chi2":
-                    # 第一階段：node counts 取 Top-K
-                    K1 = min(int(args.two_stage_k), c_node_mat.shape[0]) if args.two_stage_layout_rerank else TOPK
-                    scores_counts, idxs_counts = rank_node_counts_chi2(
-                        q_node_vec, c_node_mat, k=K1,
-                        mask_query_nonzero=args.node_chi2_mask,
-                        tau=args.node_chi2_tau
-                    )
-
-                    if args.two_stage_layout_rerank:
-                        # 第二階段：在 idxs_counts 子集中用 layout 重排
-                        scores_layout, idxs_final, chi2_layout = rerank_topk_by_layout(
-                            q_layout_mat[qi, :], c_layout_mat, idxs_counts, tau=args.node_chi2_tau
-                        )
-                        # 回傳最終的 scores/idxs（layout 決定最終排名）
-                        scores, idxs = scores_layout, idxs_final
-
-                        # 把中間分數做成 map，等會兒 rows 可一併輸出（方便比對）
-                        counts_map = {int(i): float(s) for i, s in zip(idxs_counts, scores_counts)}
-                        layout_map = {int(i): float(s) for i, s in zip(idxs_final, scores_layout)}
-                        layout_chi2_map = {int(i): float(c) for i, c in zip(idxs_final, chi2_layout)}
-
-                        pc_iou_map: Dict[int, float] = {}
-                        if args.pc_iou:
-                            # 解析 query 影像的完整路徑
-                            q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                            q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                            for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                                c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                                c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                                try:
-                                    iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                    # print(f"Computed IoU for Q {q_names[qi]} C {c_names[ci]}: {iou}")
-                                except Exception:
-                                    iou = None
-                                if iou is not None:
-                                    pc_iou_map[int(ci)] = float(iou)
-
-
-                    else:  # 沒開兩階段：維持原本 counts 的 scores/idxs
-                        scores, idxs = scores_counts, idxs_counts
-                        counts_map = {int(i): float(s) for i, s in zip(idxs, scores)}
-                        layout_map, layout_chi2_map = {}, {}  
-
-                        pc_iou_map: Dict[int, float] = {}
-                        if args.pc_iou:
-                            # 解析 query 影像的完整路徑
-                            q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                            q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                            for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                                c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                                c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                                try:
-                                    iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                    # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                                except Exception:
-                                    iou = None
-                                if iou is not None:
-                                    pc_iou_map[int(ci)] = float(iou)  
-
-                
-                elif args.node_vec_mode == "layout":
-                    scores, idxs = rank_node_layout_chi2(
-                        q_layout_mat[qi, :],        # 該 query 的 layout 向量 (4*C,)
-                        c_layout_mat,               # 全部 candidates 的 layout 矩陣 (Nc, 4*C)
-                        k=TOPK,
-                        tau=LAYOUT_TAU     # 或用 LAYOUT_TAU，也可依你習慣
-                    )
-                    # —— 立即列出 q 與 top-1 candidate 的 layout 向量（你要的檢查）——
-                    top1 = int(idxs[0])
-                    qv_dbg = q_layout_mat[qi, :].astype(int)
-                    cv_dbg = c_layout_mat[top1, :].astype(int)
-                    pc_iou_map: Dict[int, float] = {}
-                    if args.pc_iou:
-                            # 解析 query 影像的完整路徑
-                            q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                            q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                            for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                                c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                                c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                                try:
-                                    iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                    # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                                except Exception:
-                                    iou = None
-                                if iou is not None:
-                                    pc_iou_map[int(ci)] = float(iou)
-                    print("\n========== [DEBUG layout] ==========")
-                    print(f"Query image: {q_names[qi]}")
-                    print(f"Top-1 cand : {c_names[top1]}")
-                    print(f"[layout] sums -> query={int(qv_dbg.sum())}, top1={int(cv_dbg.sum())}")
-                    print(f"q_vec: {qv_dbg.tolist()}")
-                    print(f"top1_vec: {cv_dbg.tolist()}\n")
-
-                
-                
-                elif args.node_vec_mode=="attr" and args.node_metric=="chi2":
-                    # --- 新增：attribute + chi2 ---
-                    # q_node_vec / c_node_mat 已在前面 get_node_mats_by_mode() 依 "attr" 生好
-                    K1 = min(int(args.two_stage_k), c_node_mat.shape[0]) if args.two_stage_layout_rerank else TOPK
-                    scores_attr, idxs_attr = rank_node_attr_chi2(
-                        q_node_vec, c_node_mat, k=K1, tau=args.node_chi2_tau
-                    )
-                    
-                    if args.two_stage_layout_rerank:
-                        scores_layout, idxs_final, chi2_layout = rerank_topk_by_layout(
-                            q_layout_mat[qi, :], c_layout_mat, idxs_attr, tau=args.node_chi2_tau
-                        )
-                        scores, idxs = scores_layout, idxs_final
-                        # 若你也想把第一階段分數輸出到 CSV，可像 counts_map 一樣做個 attr_map
-                        attr_map = {int(i): float(s) for i, s in zip(idxs_attr, scores_attr)}
-                        layout_map = {int(i): float(s) for i, s in zip(idxs_final, scores_layout)}
-                        layout_chi2_map = {int(i): float(c) for i, c in zip(idxs_final, chi2_layout)}
-                    else:
-                        scores, idxs = scores_attr, idxs_attr
-                    
-                    top1 = int(idxs[0])
-                    qv_dbg = q_layout_mat[qi, :].astype(int)
-                    cv_dbg = c_layout_mat[top1, :].astype(int)
-
-                    pc_iou_map: Dict[int, float] = {}
-                    if args.pc_iou:
-                            # 解析 query 影像的完整路徑
-                            q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                            q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                            for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                                c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                                c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                                try:
-                                    iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                    # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                                except Exception:
-                                    iou = None
-                                if iou is not None:
-                                    pc_iou_map[int(ci)] = float(iou)
-                    print("\n========== [DEBUG layout] ==========")
-                    print(f"Query image: {q_names[qi]}")
-                    print(f"Top-1 cand : {c_names[top1]}")
-                    print(f"[layout] sums -> query={int(qv_dbg.sum())}, top1={int(cv_dbg.sum())}")
-                    print(f"q_vec: {qv_dbg.tolist()}")
-                    print(f"top1_vec: {cv_dbg.tolist()}\n")
-
-                    
-
-
-
-
-
-                elif args.node_vec_mode=="seq" and args.node_metric=="lcs_xy":
-                    # 先預備所有 query/candidate 的 (seq_x, seq_y)（建議在主迴圈外預算，但這裡為最小改動可就地處理）
-                    # 若你已有 q_graphs, c_graphs 可用，則：
-                    if 'Q_SEQ_XY_CACHE' not in globals():
-                        # 全局一次建好（避免每張 query 重複計算）
-                        global Q_SEQ_XY_CACHE, C_SEQ_XY_CACHE
-                        Q_SEQ_XY_CACHE = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
-                        C_SEQ_XY_CACHE = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
-
-                    q_seq_xy = Q_SEQ_XY_CACHE[qi]
-                    K1 = min(int(args.two_stage_k), len(C_SEQ_XY_CACHE)) if args.two_stage_layout_rerank else TOPK
-
-                    # 內建 wx=wy=0.5（不暴露 CLI）
-                    scores, idxs = rank_seq_lcs_xy(q_seq_xy, C_SEQ_XY_CACHE, top_k=K1, wx=0.5, wy=0.5)
-
-                    if args.two_stage_layout_rerank:
-                        scores_layout, idxs_final, chi2_layout = rerank_topk_by_layout(
-                            q_layout_mat[qi, :], c_layout_mat, idxs_seq, tau=args.node_chi2_tau
-                        )
-                        scores, idxs = scores_layout, idxs_final
-                        # 若要輸出第一階段分數可做 map（選用）
-                        # seq_map = {int(i): float(s) for i, s in zip(idxs_seq, scores_seq)}
-                        # layout_map = {int(i): float(s) for i, s in zip(idxs_final, scores_layout)}
-                        # layout_chi2_map = {int(i): float(c) for i, c in zip(idxs_final, chi2_layout)}  
-                    top1 = int(idxs[0])
-                    qv_dbg = q_layout_mat[qi, :].astype(int)
-                    cv_dbg = c_layout_mat[top1, :].astype(int)
-
-                    pc_iou_map: Dict[int, float] = {}
-                    if args.pc_iou:
-                            # 解析 query 影像的完整路徑
-                            q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                            q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                            for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                                c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                                c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                                try:
-                                    iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                    # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                                except Exception:
-                                    iou = None
-                                if iou is not None:
-                                    pc_iou_map[int(ci)] = float(iou)
-                    print("\n========== [DEBUG layout] ==========")
-                    print(f"Query image: {q_names[qi]}")
-                    print(f"Top-1 cand : {c_names[top1]}")
-                    print(f"[layout] sums -> query={int(qv_dbg.sum())}, top1={int(cv_dbg.sum())}")
-                    print(f"q_vec: {qv_dbg.tolist()}")
-                    print(f"top1_vec: {cv_dbg.tolist()}\n")
-
-                else:
-                    # 其它情況維持你原本（cosine）
-                    scores, idxs = rank_node_only_from_mats(q_node_vec, c_node_mat, k=TOPK, use_mask=args.use_mask)
-            
-
-            elif flag == "seq_wire":
-                # --- 1) 先備妥 Node Sequence 的 2D 投影向量（一次建好快取，避免重算） ---
-                # if 'Q_SEQ_XY_CACHE' not in globals():
-                #     global Q_SEQ_XY_CACHE, C_SEQ_XY_CACHE
-                Q_SEQ_XY_CACHE = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
-                C_SEQ_XY_CACHE = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
-
-                q_seq_xy = Q_SEQ_XY_CACHE[qi]
-                Nc = len(C_SEQ_XY_CACHE)
-
-
-                # 以「取滿庫」的方式拿到 Node Sequence 的分數（相似度越大越好）
-                seq_scores_full, idxs_full = rank_seq_lcs_xy(
-                    q_seq_xy, C_SEQ_XY_CACHE, top_k=Nc, wx=0.5, wy=0.5
-                )
-                seq_scores = np.full(Nc, -np.inf, dtype=np.float32)
-                seq_scores[idxs_full] = seq_scores_full  # 對齊到 candidates 全庫順序
-
-                # --- 2) 準備 Wireframe 的 χ²距離向量（同樣對齊到 candidates 全庫順序） ---
-                wire_dists = np.full(Nc, np.inf, dtype=np.float32)
-                if (wire_q_dict is not None) and (wire_db_mat is not None) and (wire_db_mat.size > 0):
-                    qb = Path(q_names[qi]).name
-                    qv = wire_q_dict.get(qb, None)
-                    if qv is not None:
-                        # 依 candidates 名稱找出對應到 wire_db 的列索引
-                        wire_idx_of_c = np.array([wire_db_name2idx.get(Path(n).name, -1) for n in c_names], dtype=int)
-                        m = wire_idx_of_c >= 0
-                        if np.any(m):
-                            d_all = chi2_distance_rowwise(qv, wire_db_mat[wire_idx_of_c[m], :])  # 僅算對得上的
-                            wire_dists[m] = d_all.astype(np.float32)
-
-                # --- 3) 融合：Score-level 或 Rank-level（沿用你已定義的函式與 argparse 參數） ---
-                if getattr(args, "fusion", "score") == "rrf":
-                    fused = rrf_fuse_ranks(seq_scores, wire_dists, c=int(getattr(args, "rrf_c", 60)))
-                else:
-                    fused = fuse_scores(seq_scores, wire_dists, args)
-
-                k_eff = min(TOPK, Nc)
-                part = np.argpartition(-fused, k_eff - 1)[:k_eff]
-                order = np.argsort(-fused[part])
-                idxs = part[order]
-                scores = fused[idxs].astype(np.float32)
-
-                top1 = int(idxs[0])
-
-                pc_iou_map: Dict[int, float] = {}
-                if args.pc_iou:
-                        # 解析 query 影像的完整路徑
-                        q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                        q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                        for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                            c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                            c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                            try:
-                                iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                            except Exception:
-                                iou = None
-                            if iou is not None:
-                                pc_iou_map[int(ci)] = float(iou)
-                print("\n========== [DEBUG layout] ==========")
-                print(f"Query image: {q_names[qi]}")
-                print(f"Top-1 cand : {c_names[top1]}")
-
-                # --- 4) 取前 K，並輸出 rows（維持既有輸出格式） ---
-                # k_eff = min(args.top_k, Nc)
-                # order = np.argsort(-final_scores)[:k_eff]
-                # rows = []
-                # for rnk, ci in enumerate(order, 1):
-                #     row = {
-                #         "name": c_names[ci],
-                #         "score": float(final_scores[ci]),   # 融合後的分數
-                #         "path": str(_resolve_img_path(c_names[ci], args.candidate_root)),
-                #         # 附加兩路方便除錯（可留可拿掉）
-                #         "seq_score": float(seq_scores[ci]) if np.isfinite(seq_scores[ci]) else None,
-                #         "wire_chi2": float(wire_dists[ci]) if np.isfinite(wire_dists[ci]) else None,
-                #     }
-                #     rows.append(row)
-
-                # results[qn] = rows
-
-                
-
-            elif flag == "edge":
-                scores, idxs = rank_edge_only(q_desc, c_descs, k=args.top_k, use_mask=args.use_mask, node_len=node_len)
-                # —— 立即列出 q 與 top-1 candidate 的 layout 向量（你要的檢查）——
-                top1 = int(idxs[0])
-                qv_dbg = q_layout_mat[qi, :].astype(int)
-                cv_dbg = c_layout_mat[top1, :].astype(int)
-                pc_iou_map: Dict[int, float] = {}
-                if args.pc_iou:
-                    # 解析 query 影像的完整路徑
-                    q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                    q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                    for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                        c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                        c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                        try:
-                            iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                            # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                        except Exception:
-                            iou = None
-                        if iou is not None:
-                            pc_iou_map[int(ci)] = float(iou)
-                print("\n========== [DEBUG layout] ==========")
-                print(f"Query image: {q_names[qi]}")
-                print(f"Top-1 cand : {c_names[top1]}")
-                print(f"[layout] sums -> query={int(qv_dbg.sum())}, top1={int(cv_dbg.sum())}")
-                print(f"q_vec: {qv_dbg.tolist()}")
-                print(f"top1_vec: {cv_dbg.tolist()}\n")
-
-            elif flag == "coarse":
-                # === 新增：layout 分數（exp(-chi2/τ)） ===
-                # 先計 chi-square 距離
-                diff = c_layout_mat - q_layout_vec.reshape(1, -1)
-                denom = c_layout_mat + q_layout_vec.reshape(1, -1) + 1e-8
-                chi2 = 0.5 * np.sum((diff * diff) / denom, axis=1, dtype=np.float64).astype(np.float32)
-                arr_layout = np.exp(-chi2 / float(LAYOUT_TAU)).astype(np.float32)
-
-                # 融合：s = α*node + β*edge + γ*layout
-                s_comb = N_sim * arr_node + E_sim * arr_edge + LAYOUT_WEIGHT * arr_layout
-
-                # 取 top-k（照你原本的寫法）
-                Nc = s_comb.shape[0]
-                k_eff = min(TOPK, Nc)
-                part = np.argpartition(-s_comb, k_eff - 1)[:k_eff]
-                idxs = part[np.argsort(-s_comb[part])]
-                scores = s_comb[idxs].astype(np.float32)
-                # scores, idxs = rank_coarse_with_node_scores(
-                #     q_node_vec, c_node_mat, q_desc=q_descs[qi], c_descs=c_descs, k=TOPK,
-                #     node_metric=("chi2" if (args.node_vec_mode=="counts" and args.node_metric=="chi2") else "cosine"),
-                #     use_mask=args.use_mask, tau=args.node_chi2_tau,
-                #     N_sim=N_sim, E_sim=E_sim
-                # )
-
-            elif flag == "GED":
-                # 先決定候選池
-                Nc = c_descs.shape[0]
-                poolK = min(args.ged_pool, Nc)
-
-                if args.ged_pool_source == "node":
-                    s, idx_all = rank_node_layout_chi2(
-                        q_layout_mat[qi, :],        # 該 query 的 layout 向量 (4*C,)
-                        c_layout_mat,               # 全部 candidates 的 layout 矩陣 (Nc, 4*C)
-                        k=TOPK,
-                        tau=LAYOUT_TAU     # 或用 LAYOUT_TAU，也可依你習慣
-                    )
-                    pool_idx = idx_all[:poolK]
-                elif args.ged_pool_source == "edge":
-                    s, idx_all = rank_edge_only(q_desc, c_descs, k=Nc, use_mask=args.use_mask, node_len=node_len)
-                    pool_idx = idx_all[:poolK]
-                else:  # coarse
-                    s, idx_all = rank_coarse(q_desc, c_descs, k=Nc, use_mask=args.use_mask, node_len=node_len,
-                                            N_sim=N_sim, E_sim=E_sim)
-                    pool_idx = idx_all[:poolK]
-
-                scores, idxs = rank_ged_only(qi, q_graphs, c_graphs, pool_idx=pool_idx, k=TOPK)
-                # scores, idxs = rank_by_ged_all_candidates(q_graphs[qi], c_graphs, top_k=TOPK)  
-
-                # —— 立即列出 q 與 top-1 candidate 的 layout 向量（你要的檢查）——
-                top1 = int(idxs[0])
-                qv_dbg = q_layout_mat[qi, :].astype(int)
-                cv_dbg = c_layout_mat[top1, :].astype(int)
-                pc_iou_map: Dict[int, float] = {}
-                if args.pc_iou:
-                    # 解析 query 影像的完整路徑
-                    q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                    q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                    for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                        c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                        c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                        try:
-                            iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                            # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                        except Exception:
-                            iou = None
-                        if iou is not None:
-                            pc_iou_map[int(ci)] = float(iou)
-                print("\n========== [DEBUG layout] ==========")
-                print(f"Query image: {q_names[qi]}")
-                print(f"Top-1 cand : {c_names[top1]}")
-                print(f"[layout] sums -> query={int(qv_dbg.sum())}, top1={int(cv_dbg.sum())}")
-                print(f"q_vec: {qv_dbg.tolist()}")
-                print(f"top1_vec: {cv_dbg.tolist()}\n")
-
-            elif flag == "Wireframe":
-                scores, idxs = rank_wireframe_only(
-                    q_name=qn,
-                    wire_q_dict=wire_q_dict,
-                    wire_db_mat=wire_db_mat,
-                    wire_db_name2idx=wire_db_name2idx,
-                    cand_names=c_names,
-                    k=TOPK,
-                    wire_tau=getattr(args, "wire_tau", 0.0),
-                )
-                top1 = int(idxs[0])
-
-                pc_iou_map: Dict[int, float] = {}
-                if args.pc_iou:
-                        # 解析 query 影像的完整路徑
-                        q_img_path = _resolve_img_path(q_names[qi], args.query_root)
-                        q_img_path_str = str(q_img_path) if q_img_path is not None else str(q_names[qi])
-
-                        for ci in (idxs.tolist() if hasattr(idxs, "tolist") else idxs):
-                            c_img_path = _resolve_img_path(c_names[ci], args.candidate_root)
-                            c_img_path_str = str(c_img_path) if c_img_path is not None else str(c_names[ci])
-
-                            try:
-                                iou = compute_pc_iou_for_pair(q_img_path_str, c_img_path_str, voxel_size=float(args.pc_voxel_size))
-                                # print(f"Computed IoU for Q {qi} C {ci}: {iou}")
-                            except Exception:
-                                iou = None
-                            if iou is not None:
-                                pc_iou_map[int(ci)] = float(iou)
-                print("\n========== [DEBUG layout] ==========")
-                print(f"Query image: {q_names[qi]}")
-                print(f"Top-1 cand : {c_names[top1]}")
-            
-            else:
-                raise ValueError(f"Unknown viz_flag: {flag}")
-            
-            # 先準備 counts（若你已有就重用）
-            q_counts_vec = q_node_vec if (args.node_vec_mode=="counts") else None
-            # 名稱→索引
-            cand_name2idx = {name:i for i,name in enumerate(c_names)}
-            for i,name in enumerate(c_names):
-                cand_name2idx[Path(name).name] = i
-
-            # 整理輸出 rows
-            rows = []
-            # print(scores)
-            scores_map = {int(i): float(s) for i, s in zip(idxs, scores)}
-
-            for r, ci in enumerate(idxs, 1):
-                cn = c_names[ci]
-                row = {
-                    "rank": r,
-                    "name": cn,
-                    "score": float(scores[r-1]) if r-1 < len(scores) else None,
-                    "path": c_name2img.get(cn, cn)
-                }
-                if args.pc_iou:
-                    row["pc_iou"] = pc_iou_map.get(int(ci))
-                if args.node_vec_mode=="counts" and args.node_metric=="chi2":
-                    node_chi2 = chi2_distance_pair(q_counts_vec, c_node_mat[ci, :])  # 正的距離
-                    row["node_chi2"] = float(node_chi2)
-
-                if args.node_vec_mode == "layout":
-                    qv = q_layout_mat[qi, :].astype(np.float32).reshape(1, -1)
-                    cv = c_layout_mat[ci:ci+1, :].astype(np.float32)
-                    diff  = cv - qv
-                    denom = cv + qv + 1e-8
-                    chi2_one = float(0.5 * np.sum((diff * diff) / denom, axis=1, dtype=np.float64))
-                    row["layout_chi2"] = chi2_one
-                    row["layout_score"] = float(np.exp(-chi2_one / float(args.node_chi2_tau)))  # 或用 LAYOUT_TAU
-
-                # counts 版 χ²（9 維），不論是否兩階段都可列
-                if args.node_vec_mode=="counts" and args.node_metric=="chi2":
-                    node_chi2 = chi2_distance_pair(q_node_vec, c_node_mat[ci, :])
-                    row["node_chi2"] = float(node_chi2)
-
-                # 若有開兩階段，把前一階段（counts）的分數也記起來
-                if args.node_vec_mode=="counts" and args.node_metric=="chi2" and args.two_stage_layout_rerank:
-                    row["counts_score_stage1"] = counts_map.get(int(ci))
-
-                # 若有做 layout 重排，也把 layout 分數與 chi2 寫進來
-                if args.two_stage_layout_rerank:
-                    # 若是 layout 決定最終排名，這兩項會有值；否則留空
-                    if int(ci) in layout_map:
-                        row["layout_score_stage2"] = layout_map[int(ci)]
-                    if int(ci) in layout_chi2_map:
-                        row["layout_chi2_stage2"] = layout_chi2_map[int(ci)]
-                rows.append(row)
-            results[qn] = rows
-
-
-            # cand name → idx
-            cand_name2idx = {name: i for i, name in enumerate(c_names)}
-            for i, name in enumerate(c_names):
-                cand_name2idx[Path(name).name] = i
-
-            # node_len 與 Query node
-            _, _, node_len = split_node_edge_desc(c_descs)
-            q_node_vec = q_descs[qi][:node_len]
-
-            # class 名稱與統計維度
-            class_names = list(STRUCTURAL_CLASSES)
-            stat_per_class = STAT_PER_CLASS
-
-            # 建 cand 名稱 → graph（全名與 basename 都建）
-            cand_name2graph = {name: g for name, g in zip(c_names, c_graphs)}
-            for name, g in zip(c_names, c_graphs):
-                cand_name2graph[Path(name).name] = g
-
-            # 優先用完整 query 路徑（避免 missing）
-            q_img = q_name2img.get(q_names[qi], q_names[qi])
-
-            #---
-            # [C-1] 取得這張 query 的 ref 名稱
-            q_canon = _canon_name(q_names[qi])
-            ref_canon = mi_map.get(q_canon, None)
-
-            # === 產生 ref_item（不重算，直接用當前候選 rows 的現成分數；不在 top-K 就顯示圖 + N/A） ===
-            ref_item = None
-            if ref_canon is not None:
-                # 1) 先在本張 query 的 top-K 候選 rows 裡找看看
-                matched_row = None
-                for row in rows:
-                    # rows[i]["name"] 可能是完整路徑或相對路徑，統一轉成 canon 後比對
-                    try:
-                        nm_canon = _canon_name(row.get("name", ""))
-                    except Exception:
-                        nm_canon = ""
-                    if nm_canon == ref_canon:
-                        matched_row = row
-                        break
-
-                if matched_row is not None:
-                    # 找到：直接用現成的 score 與 path，不做任何重新計算
-                    ref_item = {
-                        "name": matched_row.get("name", "ref"),
-                        "path": matched_row.get("path", matched_row.get("name")),
-                        "score": matched_row.get("score"),   # 現成分數
-                        "pc_iou": matched_row.get("pc_iou")  # 若你有算 pc_iou 就一起帶
-                    }
-                else:
-                    # 找不到：只顯示圖與名稱，不計分（score=None）
-                    # 優先用 c_name2img 對應出可讀取的影像路徑；沒有就用 candidate_root/ref_canon.*
-                    ref_img_path = c_name2img.get(ref_canon)
-                    if (not ref_img_path) and args.candidate_root:
-                        for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-                            p = Path(args.candidate_root) / (ref_canon + ext)
-                            if p.exists():
-                                ref_img_path = str(p)
-                                break
-
-                    ref_item = {
-                        "name": ref_canon,
-                        "path": ref_img_path if ref_img_path else ref_canon,
-                        "score": None,
-                        "pc_iou": None
-                    }
-            #---
-
-            
-            if args.viz_display_counts and (q_node_mat is not None) and (c_node_mat is not None):
-                q_counts_vec_viz = q_node_mat[qi, :]
-                c_counts_mat_viz = c_node_mat
-            else:
-                q_counts_vec_viz = None
-                c_counts_mat_viz = None
-            
-            q_layout_vec_viz = q_layout_mat[qi, :]
-            c_layout_mat_viz = c_layout_mat
-
-            if args.viz_flag == "edge":
-                q_counts_vec_viz=None
-                c_counts_mat_viz=None
-                q_layout_vec_viz=None
-                c_layout_mat_viz=None
-
-            
-
-            visualize_grid_pages(
-                query_item=qn,
-                top_refs=rows,
-                out_dir=out_collage,
-                base_name=Path(qn).stem,
-                query_root=args.query_root,
-                cand_root=args.candidate_root,
-                cols=args.viz_cols,                     # 若未給，display_counts=True → 5
-                cell_w_override=args.viz_cell_w,        # 若未給，display_counts=True → 560
-                # counts 顯示
-                display_counts=args.viz_display_counts, # ★ 開關
-                class_order=class_order,
-                q_counts_vec=q_counts_vec_viz,
-                c_counts_mat=c_counts_mat_viz,
-                name2idx_for_counts=name2idx_for_counts,
-                q_layout_vec=q_layout_vec_viz,
-                c_layout_mat=c_layout_mat_viz,
-                layout_rows=LAYOUT_ROWS,               # = 2
-                layout_cols=LAYOUT_COLS,               # = 2
-                layout_classes=STRUCTURAL_CLASSES,
-                overlay_nodes_2d=args.viz_overlay_nodes_2d,   # 開關
-                proj_intrin_query="real",                     # 依你需求強制 real
-                proj_intrin_cand="syn",                       # 依你需求強制 syn
-                q_graph=q_graphs[qi],
-                cand_name2graph=cand_name2graph,
-                overlay_fontscale=args.viz_overlay_fontscale,
-                ref_item=ref_item,                             # 參考影像（若有的話）
-            )
-
-        # === 所有 query 都處理完之後 ===
-        if args.pc_iou:
-            summary, details = compute_pc_iou_metrics(results, iou_th=float(args.pc_iou_th))
-
-            # 印到 console
-            print("\n========== Point Cloud IoU Metrics ==========")
-            print(f"Queries             : {summary['num_queries']}")
-            print(f"IoU threshold       : {summary['iou_threshold']:.3f}")
-            print(f"At-least-one hit    : {summary['queries_with_at_least_one_hit']} "
-                f"({summary['hit_rate']*100:.2f}%)")
-            print(f"Avg #hits per query : {summary['avg_retrieved_per_query']:.3f}")
-            print(f"MRR                 : {summary['mrr']:.4f}")
-        
-
-        # 額外輸出 MI-style JSON：query_image → [{"ref_image": candidate_image}, ...]
-        if args.coarse_output:
-            mi_results = {"results": {}}
-            for qn in q_names:
-                rows = results.get(qn, [])
-                # 將 query 名稱解析為完整影像路徑（用 query_root 變成絕對路徑）
-                q_img_path = _resolve_img_path(qn, args.query_root)
-                ref_list = []
-                for row in rows:
-                    # 用 candidate_root 把 candidate 解析成完整路徑
-                    ref_path = _resolve_img_path(row, args.candidate_root)
-                    ref_list.append({"ref_image": ref_path})
-                mi_results["results"][q_img_path] = ref_list
-
-            out_coarse = str(args.coarse_output)
-            os.makedirs(os.path.dirname(out_coarse), exist_ok=True)
-            with open(out_coarse, "w", encoding="utf-8") as f:
-                json.dump(mi_results, f, ensure_ascii=False, indent=2)
-            print(f"[{flag}] MI-style results saved to: {out_coarse}")
-
-
-        # 寫 JSON 與 CSV
-        write_results_json(str(out_json), results)
-        write_results_csv(str(out_csv), results)
-
-        print(f"[{flag}] results saved to: {out_json} and {out_csv}")
-        print(f"[{flag}] collages saved to: {out_collage}")
-        return
-
+    class_order = list(STRUCTURAL_CLASSES)
+    q_seq_cache = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
+    c_seq_cache = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
+
+    q_name2img = name2imgpath_from_graphs(q_names, q_graphs)
+    c_name2img = name2imgpath_from_graphs(c_names, c_graphs)
+
+    wire_db_mat = None
+    wire_db_name2idx = None
+    wire_q_dict = None
+    if args.wire_candidate_json and args.wire_query_json:
+        db_entries = load_wire_json(args.wire_candidate_json)
+        q_entries = load_wire_json(args.wire_query_json)
+        if args.wire_target_hw is not None:
+            H, W = map(int, args.wire_target_hw)
+        elif q_entries:
+            H = int(q_entries[0].get('height', 1080))
+            W = int(q_entries[0].get('width', 1920))
+        else:
+            H, W = 1080, 1920
+        rows, cols = map(int, args.wire_grid)
+        score_th = float(args.wire_score_th)
+        num_bins = int(args.wire_bins)
+        q_basenames = {Path(p).name for p in q_name2img.values()}
+        c_basenames = {Path(p).name for p in c_name2img.values()}
+        wire_db_mat, wire_db_name2idx = build_wire_db_from_json(
+            db_entries, H, W, rows, cols, score_th, num_bins, keep_basenames=c_basenames
+        )
+        wire_q_dict = build_wire_q_from_json(
+            q_entries, H, W, rows, cols, score_th, num_bins, keep_basenames=q_basenames
+        )
+
+    out_dir = Path(args.out_root)
+    out_collage = out_dir / "collages"
+    out_json = out_dir / Path(args.output_json).name
+    out_csv = out_dir / (Path(args.output_json).stem + ".csv")
+    os.makedirs(out_collage, exist_ok=True)
+
+    cand_name2graph = {name: g for name, g in zip(c_names, c_graphs)}
+    for name, g in zip(c_names, c_graphs):
+        cand_name2graph[Path(name).name] = g
+
+    results = {}
+    for qi, qn in enumerate(q_names):
+        q_seq_xy = q_seq_cache[qi]
+        Nc = len(c_seq_cache)
+        seq_scores_full, idxs_full = rank_seq_lcs_xy(q_seq_xy, c_seq_cache, top_k=Nc, wx=0.5, wy=0.5)
+        seq_scores = np.full(Nc, -np.inf, dtype=np.float32)
+        seq_scores[idxs_full] = seq_scores_full
+
+        wire_dists = np.full(Nc, np.inf, dtype=np.float32)
+        if (wire_q_dict is not None) and (wire_db_mat is not None) and (wire_db_mat.size > 0):
+            qb = Path(qn).name
+            qv = wire_q_dict.get(qb, None)
+            if qv is not None:
+                wire_idx_of_c = np.array([wire_db_name2idx.get(Path(n).name, -1) for n in c_names], dtype=int)
+                m = wire_idx_of_c >= 0
+                if np.any(m):
+                    d_all = chi2_distance_rowwise(qv, wire_db_mat[wire_idx_of_c[m], :])
+                    wire_dists[m] = d_all.astype(np.float32)
+
+        if args.fusion == 'rrf':
+            fused = rrf_fuse_ranks(seq_scores, wire_dists, c=int(args.rrf_c))
+        else:
+            fused = fuse_scores(seq_scores, wire_dists, args)
+
+        k_eff = min(int(args.top_k), Nc)
+        part = np.argpartition(-fused, k_eff - 1)[:k_eff]
+        order = np.argsort(-fused[part])
+        idxs = part[order]
+        scores = fused[idxs].astype(np.float32)
+
+        rows = []
+        for rank, ci in enumerate(idxs, 1):
+            cn = c_names[ci]
+            rows.append({
+                "rank": rank,
+                "name": cn,
+                "score": float(scores[rank - 1]),
+                "path": c_name2img.get(cn, cn),
+                "seq_score": float(seq_scores[ci]) if np.isfinite(seq_scores[ci]) else None,
+                "wire_chi2": float(wire_dists[ci]) if np.isfinite(wire_dists[ci]) else None,
+            })
+        results[qn] = rows
+
+        visualize_grid_pages(
+            query_item=qn,
+            top_refs=rows,
+            out_dir=out_collage,
+            base_name=Path(qn).stem,
+            query_root=args.query_root,
+            cand_root=args.candidate_root,
+            display_counts=False,
+            class_order=class_order,
+            q_counts_vec=None,
+            c_counts_mat=None,
+            name2idx_for_counts=None,
+            q_layout_vec=None,
+            c_layout_mat=None,
+            overlay_nodes_2d=False,
+            q_graph=q_graphs[qi],
+            cand_name2graph=cand_name2graph,
+        )
+
+    if args.coarse_output:
+        mi_results = {"results": {}}
+        for qn in q_names:
+            q_img_path = _resolve_img_path(qn, args.query_root)
+            ref_list = []
+            for row in results.get(qn, []):
+                ref_path = _resolve_img_path(row["name"], args.candidate_root)
+                ref_list.append({"ref_image": ref_path})
+            mi_results["results"][str(q_img_path)] = ref_list
+        out_coarse = str(args.coarse_output)
+        os.makedirs(os.path.dirname(out_coarse), exist_ok=True)
+        with open(out_coarse, "w", encoding="utf-8") as f:
+            json.dump(mi_results, f, ensure_ascii=False, indent=2)
+        print(f"[seq_wire] MI-style results saved to: {out_coarse}")
+
+    write_results_json(str(out_json), results)
+    write_results_csv(str(out_csv), results)
+    print(f"[seq_wire] results saved to: {out_json} and {out_csv}")
+    print(f"[seq_wire] collages saved to: {out_collage}")
 if __name__ == '__main__':
     main()
