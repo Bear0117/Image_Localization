@@ -240,6 +240,8 @@ def build_scene_graph_from_components(components: List[Dict],
     fx = fy = cx = cy = None
     if camera_intrinsics is not None:
         fx, fy, cx, cy = camera_intrinsics
+    elif depth is not None:
+        raise ValueError("camera_intrinsics must be provided when depth maps are used.")
     # for idx, comp in enumerate(components):
     #     struct = comp['category']
     #     area = comp['mask'].sum() / (W * H)
@@ -252,6 +254,12 @@ def build_scene_graph_from_components(components: List[Dict],
     #                depth=float(np.mean(depth[comp['mask']])) if depth is not None else 0.0,
     #                theta=theta,
     #                base=struct)
+
+    if depth is not None:
+        depth = depth.astype(np.float32)
+        dmin, dmax = float(depth.min()), float(depth.max())
+        if dmin < -1e-6 or dmax > 1.000001:
+            depth = (depth - dmin) / (dmax - dmin + 1e-6)
 
     for idx, comp in enumerate(components):
         # 2D 資訊保持不變
@@ -492,6 +500,7 @@ def save_real_vis(fn: str, rgb: np.ndarray, comps: list, g: nx.Graph, OUTPUT_VIS
     plt.tight_layout()
     fig.savefig(str(out_path))
     plt.close(fig)
+    return out_path
     
     
     
