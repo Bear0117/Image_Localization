@@ -2,7 +2,9 @@ import os
 import json
 import itertools
 from pathlib import Path
+from functools import partial
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -14,12 +16,14 @@ from pycocotools import mask as mask_util
 
 import utils.utils as utils  # reuse build_scene_graph_from_components, graph_descriptor, graph_to_dict
 
-REAL_FOLDER      = Path("/D/hoa/Delta_project/Dataset_0605_Reading/rgb/")
-COCO_JSON        = Path("/D/lulu/home/Delta/graph/YOLO_anno/readingRoom/readingRoom_annotations.coco.json")
-OUTPUT_JSON_REAL = Path("/D/lulu/Delta/graph/readingRoom/r611_sim.json")
-OUTPUT_VIS_REAL  = Path("/D/lulu/Delta/graph/readingRoom/vis_sim/")
-DEPTH_FOLDER     = Path("/D/lulu/Delta/Image_data/depth_maps/readingRoom_depth/")
-CAMERA_INTRINSICS = np.array([1649.5450819708324, 1649.719272635186, 1200.0,  673.5], dtype=float)
+TEMP_ROOT = Path(os.environ.get("IL_TEMP_DIR", "/tmp/image_localization"))
+REAL_FOLDER = Path(os.environ.get("IL_RGB_DIR", TEMP_ROOT / "rgb"))
+COCO_JSON = Path(os.environ.get("IL_COCO_JSON", TEMP_ROOT / "annotations.coco.json"))
+OUTPUT_JSON_REAL = Path(os.environ.get("IL_GRAPH_JSON", TEMP_ROOT / "graphs.json"))
+OUTPUT_VIS_REAL = Path(os.environ.get("IL_VIS_DIR", TEMP_ROOT / "vis"))
+DEPTH_FOLDER = Path(os.environ.get("IL_DEPTH_DIR", TEMP_ROOT / "depth"))
+CAMERA_INTRINSICS = np.array([1649.5450819708324, 1649.719272635186, 1200.0, 673.5], dtype=float)
+TARGET_SIZE = (1920, 1080)  # (W, H)
 
 
 STRUCTURAL_CLASSES = [
@@ -58,61 +62,81 @@ ANGLE_BINS, DIST_BINS = 4, 4
 EDGE_DIM = ANGLE_BINS * DIST_BINS
 BBOX_PAD = 0.1
 
-coco = json.load(open(COCO_JSON, 'r', encoding='utf-8'))
-# image_id -> filename (from extra["name"])
-images_map = {
-    img['id']: img.get('extra',{}).get('name')
-    for img in coco['images']
-    if img.get('extra',{}).get('name') and 
-       (REAL_FOLDER / img['extra']['name']).exists()
-}
-orig_size_map = {
-    img['id']: (img['width'], img['height'])
-    for img in coco['images']
-    if img['id'] in images_map
-}
+def load_annotation_index(coco_path: Path, real_folder: Path):
+    """
+    Load a COCO-style annotation JSON and build lookup tables scoped to the
+    provided RGB folder. The loader is flexible enough for temporary Gradio
+    outputs as long as they follow the COCO structure.
+    """
+    coco = json.load(open(coco_path, 'r', encoding='utf-8'))
 
-# category_id -> raw category name
-cat_map = {c['id']: c['name'] for c in coco['categories']}
-# group annotations by image
-from collections import defaultdict
-anns_by_img = defaultdict(list)
-for ann in coco['annotations']:
-    if ann['image_id'] in images_map:
-        anns_by_img[ann['image_id']].append(ann)
+    images_map = {}
+    for img in coco['images']:
+        name = img.get('extra', {}).get('name') or img.get('file_name')
+        if not name:
+            continue
+        path = real_folder / name
+        if not path.exists():
+            continue
+        images_map[img['id']] = path
+    orig_size_map = {
+        img['id']: (img['width'], img['height'])
+        for img in coco['images']
+        if img['id'] in images_map
+    }
+
+    cat_map = {c['id']: c['name'] for c in coco['categories']}
+
+    from collections import defaultdict
+    anns_by_img = defaultdict(list)
+    for ann in coco['annotations']:
+        if ann['image_id'] in images_map:
+            anns_by_img[ann['image_id']].append(ann)
+
+    return images_map, orig_size_map, cat_map, anns_by_img
 
 
-def process_real(image_id: int) -> dict:
+def normalize_depth_map(depth: np.ndarray) -> np.ndarray:
+    depth = depth.astype(np.float32)
+    dmin, dmax = float(depth.min()), float(depth.max())
+    if dmax - dmin < 1e-6:
+        return np.zeros_like(depth, dtype=np.float32)
+    return (depth - dmin) / (dmax - dmin + 1e-6)
+
+
+def process_real(
+    image_id: int,
+    *,
+    images_map: Dict[int, Path],
+    orig_size_map: Dict[int, Tuple[int, int]],
+    cat_map: Dict[int, str],
+    anns_by_img: Dict[int, list],
+    depth_folder: Path,
+    output_vis_real: Path,
+    camera_intrinsics: Optional[np.ndarray] = None,
+    target_size: Tuple[int, int] = TARGET_SIZE,
+) -> Optional[Tuple[nx.Graph, Path, np.ndarray]]:
     fn = images_map[image_id]
-    img_path = REAL_FOLDER / fn
+    img_path = Path(fn)
     orig_w, orig_h = orig_size_map[image_id]
 
     rgb_orig = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_BGR2RGB)
 
-
-    depth_filename = Path(fn).name + '.npy'
-    depth_path     = DEPTH_FOLDER / depth_filename
+    depth_filename = f"{img_path.stem}.npy"
+    depth_path = depth_folder / depth_filename
     try:
         depth_map = np.load(str(depth_path))
     except FileNotFoundError:
-        print(f"[Warning] depth not found for {fn}, skipping.")
+        print(f"[Warning] depth not found for {img_path.name}, skipping.")
         return None
 
-
-    target_size = (1920, 1080)  # (W, H)
     W, H = target_size
     scale_x = W / orig_w
     scale_y = H / orig_h
 
-
-
-    rgb  = cv2.resize(rgb_orig,  target_size, interpolation=cv2.INTER_LINEAR)
-    depth = cv2.resize(depth_map, target_size, interpolation=cv2.INTER_NEAREST)
-
-    dmin, dmax = float(depth.min()), float(depth.max())
-    depth = (depth - dmin) / (dmax - dmin + 1e-6)
-
-
+    rgb = cv2.resize(rgb_orig, target_size, interpolation=cv2.INTER_LINEAR)
+    depth_resized = cv2.resize(depth_map, target_size, interpolation=cv2.INTER_NEAREST)
+    depth = normalize_depth_map(depth_resized)
 
     comps = []
     for ann in anns_by_img[image_id]:
@@ -122,75 +146,82 @@ def process_real(image_id: int) -> dict:
         if struct not in STRUCTURAL_CLASSES:
             continue
 
-        x,y,w,h = ann['bbox']
-        x *= scale_x;  y *= scale_y
-        w *= scale_x;  h *= scale_y
+        x, y, w, h = ann['bbox']
+        x *= scale_x
+        y *= scale_y
+        w *= scale_x
+        h *= scale_y
         cx = x + w / 2
         cy = y + h / 2
-        # create bbox mask for area ratio (optional)
-        mask_uint8 = np.zeros((H, W), dtype=np.uint8)
-        segs = ann.get('segmentation', [])
-        # for seg in segs:
-        #     pts = np.array(seg, dtype=np.float32).reshape(-1, 2)
-        #     pts[:, 0] *= scale_x
-        #     pts[:, 1] *= scale_y
-        #     cv2.fillPoly(mask_uint8, [pts.astype(np.int32)], 1)
-        # mask = mask_uint8.astype(bool)  # 之後方便用 boolean indexing
 
         mask_uint8 = np.zeros((H, W), dtype=np.uint8)
         segs = ann.get('segmentation', [])
         for seg in segs:
             if isinstance(seg, dict):
-                # RLE 格式
-                m = mask_util.decode(seg)     # 產生 (H, W) 二值 mask :contentReference[oaicite:5]{index=5}
+                m = mask_util.decode(seg)
                 mask_uint8 |= m.astype(np.uint8)
             else:
-                # 多邊形頂點
-                pts = np.array(seg, dtype=np.float32).reshape(-1,2)
-                pts[:,0] *= scale_x; pts[:,1] *= scale_y
+                pts = np.array(seg, dtype=np.float32).reshape(-1, 2)
+                pts[:, 0] *= scale_x
+                pts[:, 1] *= scale_y
                 cv2.fillPoly(mask_uint8, [pts.astype(np.int32)], 1)
-        mask = mask_uint8.astype(bool)        
+        mask = mask_uint8.astype(bool)
         if not mask.any():
             continue
         comps.append({
             'category': struct,
-            'bbox': (x,y,w,h),
-            'center': (cx/W, cy/H),
+            'bbox': (x, y, w, h),
+            'center': (cx / W, cy / H),
             'mask': mask
         })
 
     if not comps:
         return None
 
-    # build scene graph
     g = utils.build_scene_graph_from_components(
-        comps, W, H, depth, RELATION_RULES, BBOX_PAD, CAMERA_INTRINSICS
+        comps, W, H, depth, RELATION_RULES, BBOX_PAD, camera_intrinsics or CAMERA_INTRINSICS
     )
-    if g.number_of_nodes()==0:
+    if g.number_of_nodes() == 0:
         return None
 
-    # descriptor
+    g.graph['image'] = img_path.name
     vec = utils.graph_descriptor(
         g, STRUCTURAL_CLASSES, EDGE_DIM, ANGLE_BINS, DIST_BINS
     )
 
-    # save visualization
-    utils.save_real_vis(fn, rgb, comps, g, OUTPUT_VIS_REAL)
+    vis_path = utils.save_real_vis(img_path.name, rgb, comps, g, output_vis_real)
 
-    # return JSON entry
-    return utils.graph_to_dict(g, fn, vec)
+    return g, vis_path, vec
 
 
 def main_real():
+    images_map, orig_size_map, cat_map, anns_by_img = load_annotation_index(COCO_JSON, REAL_FOLDER)
+
+    worker = partial(
+        process_real,
+        images_map=images_map,
+        orig_size_map=orig_size_map,
+        cat_map=cat_map,
+        anns_by_img=anns_by_img,
+        depth_folder=DEPTH_FOLDER,
+        output_vis_real=OUTPUT_VIS_REAL,
+        camera_intrinsics=CAMERA_INTRINSICS,
+        target_size=TARGET_SIZE,
+    )
+
     results = []
     image_ids = list(images_map.keys())
     with ProcessPoolExecutor(max_workers=os.cpu_count()) as exe:
-        futures = { exe.submit(process_real, img_id): img_id for img_id in image_ids }
+        futures = {exe.submit(worker, img_id): img_id for img_id in image_ids}
         for future in tqdm(as_completed(futures),
                            total=len(futures),
                            desc="Processing Real"):
             res = future.result()
-            if res: results.append(res)
+            if not res:
+                continue
+            g, vis_path, vec = res
+            img_name = g.graph.get('image', images_map[futures[future]].name)
+            results.append(utils.graph_to_dict(g, img_name, vec))
 
     with open(OUTPUT_JSON_REAL, 'w') as f:
         json.dump(results, f, indent=2)
