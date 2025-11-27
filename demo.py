@@ -66,43 +66,6 @@ CY_SYN = 540.0
 def _class_to_id_map(class_order):
     return {c: i for i, c in enumerate(class_order)}
 
-# def build_seq_xy(g, class_order, exclude_set=None):
-#     """
-#     從單一 graph 產生兩條類別序列：
-#       - seq_x: 依 x 由小到大排序，轉 class_id 序列
-#       - seq_y: 依 y 由小到大排序，轉 class_id 序列
-#     ties 規則：
-#       - x 相同時以 y 由小到大打破；若 (x,y) 皆同則維持穩定排序
-#       - y 相同時以 x 由小到大打破；若 (x,y) 皆同則維持穩定排序
-#     僅保留 category ∈ class_order，且不在 exclude_set 中的節點
-#     """
-#     cls2id = _class_to_id_map(class_order)
-#     nodes = []
-#     for _, d in g.nodes(data=True):
-#         cat = d.get("category", None)
-#         if cat not in cls2id:
-#             continue
-#         if exclude_set and cat in exclude_set:
-#             continue
-#         x = d.get("x", None)
-#         y = d.get("y", None)
-#         if x is None or y is None:
-#             continue
-#         try:
-#             x = float(x); y = float(y)
-#         except Exception:
-#             continue
-#         nodes.append((x, y, cls2id[cat]))
-
-#     # x 排序：x↑，平手用 y↑，再用原序穩定
-#     nodes_x = sorted(nodes, key=lambda t: (t[0], t[1]))
-#     # y 排序：y↑，平手用 x↑，再用原序穩定
-#     nodes_y = sorted(nodes, key=lambda t: (t[1], t[0]))
-
-#     seq_x = [cid for _, _, cid in nodes_x]
-#     seq_y = [cid for _, _, cid in nodes_y]
-#     return seq_x, seq_y
-
 def build_seq_xy(g, class_order, exclude_set=None, intrinsics: str = "auto"):
     """
     由單一 graph 產生兩條「以影像座標排序」的類別序列：
@@ -235,18 +198,6 @@ def _project_uv(center_xyz, fx: float, fy: float, cx: float, cy: float) -> Optio
     u = fx * (X / Z) + cx
     v = fy * (Y / Z) + cy
     return (u, v)
-
-
-
-
-# def _project_uv(center_xyz: Tuple[float,float,float],
-#                 fx: float, fy: float, cx: float, cy: float) -> Optional[Tuple[float,float]]:
-#     X, Y, Z = float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2])
-#     if not math.isfinite(Z) or Z <= 1e-8:
-#         return None
-#     u = fx * (X / Z) + cx
-#     v = fy * (Y / Z) + cy
-#     return (u, v)
 
 def _build_layout_counts_one(
     graph,
@@ -1756,26 +1707,6 @@ def rank_node_layout_chi2(q_layout_vec: np.ndarray,
     tau = max(np.median(chi2), 1e-6)         # 自動定標
     sim = np.exp(-chi2 / tau).astype(np.float32)
 
-    # ----------L1 or L2-------------
-    # diff = C - q  # 會自動廣播到 (Nc, 4*C)
-    # norm = "l2"   # "l1" or "l2"
-
-    # if norm == "l1":
-    #     d = np.sum(np.abs(diff), axis=1, dtype=np.float64).astype(np.float32)          # (Nc,)
-    # elif norm == "l2":
-    #     d = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float64)).astype(np.float32)  # (Nc,)
-    # else:
-    #     raise ValueError("dist 只接受 'l1' 或 'l2'")
-    # sim = -d.astype(np.float32)
-
-    # Cosine similarity
-    # qn = np.linalg.norm(q) + eps
-    # Cn = np.linalg.norm(C, axis=1, keepdims=True) + eps
-    # sim = (C @ q.T).squeeze(1) / (Cn.squeeze(1) * qn)   # [-1,1]
-
-
-
-
     # Top-k（降序）
     k_eff = max(1, min(int(k), sim.shape[0]))
     part = np.argpartition(-sim, k_eff - 1)[:k_eff]
@@ -1887,7 +1818,6 @@ def _build_node_attr_one(g, class_order):
     if s > 0:
         vec /= s
     return vec.astype(np.float32)
-
 
 def build_node_attr_mat(graphs, class_order):
     """
