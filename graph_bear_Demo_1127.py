@@ -6,6 +6,8 @@ import faiss
 import networkx as nx
 import numpy as np
 import csv
+import cv2
+
 
 import os
 from networkx.algorithms.similarity import optimize_edit_paths
@@ -13,7 +15,6 @@ from typing import Optional, List, Dict, Tuple, Sequence, Mapping, Any
 from PIL import Image, ImageDraw, ImageFont
 from scipy.spatial import cKDTree
 import open3d as o3d
-from construct_real_graph import real_main
 
 # Test
 ALPHA = 1.0
@@ -328,6 +329,41 @@ def chi2_to_similarity(d: np.ndarray, tau: float) -> np.ndarray:
     # 先用 float64 算 exp 再 cast，並裁剪指數避免下溢
     x = np.clip(d / tau, 0.0, 50.0)           # 50 對 float32 夠保守（exp(-50)≈1.9e-22）
     return np.exp(-x, dtype=np.float64).astype(np.float32)
+
+def count_gluestick_matches(query_img_path: str, cand_img_path: str) -> int:
+    """
+    預設用 OpenCV ORB 當作 placeholder，回傳 local feature matches 的數量。
+    若你已經有自己的 GlueStick pipeline，可以直接把這個函式內容換成：
+      - 呼叫 GlueStick
+      - 讀出 matches
+      - 回傳 matches 的數量（int）
+    """
+    img1 = cv2.imread(str(query_img_path), cv2.IMREAD_GRAYSCALE)
+    img2 = cv2.imread(str(cand_img_path), cv2.IMREAD_GRAYSCALE)
+    if img1 is None or img2 is None:
+        print(f"[warn] fail to read images for matching: {query_img_path}, {cand_img_path}")
+        return 0
+
+    # ORB keypoints + BF matcher，僅作為 GlueStick 的佔位實作
+    orb = cv2.ORB_create(5000)
+    k1, d1 = orb.detectAndCompute(img1, None)
+    k2, d2 = orb.detectAndCompute(img2, None)
+    if d1 is None or d2 is None:
+        return 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    knn = bf.knnMatch(d1, d2, k=2)
+
+    good = 0
+    for m in knn:
+        if len(m) < 2:
+            continue
+        m1, m2 = m
+        if m1.distance < 0.75 * m2.distance:
+            good += 1
+
+    return good
+
 
 def name2imgpath_from_graphs(names: List[str], graphs: List) -> Dict[str, str]:
     """
@@ -646,7 +682,6 @@ def main():
     args = parser.parse_args()
 
     # Construct real graph
-    real_main()
 
     # Load graphs
     q_names, q_graphs, q_descs = load_graphs(args.query_json)
@@ -737,20 +772,18 @@ def main():
         # 依旗標執行
         TOPK = 50
         results = {}
-        mi_map = load_mi_map(args.mi_json) if args.mi_json else {}
         args._ref_map = mi_map
+        Q_SEQ_XY_CACHE = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
+        C_SEQ_XY_CACHE = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
 
         for qi, qn in enumerate(q_names):
             q_desc = q_descs[qi]
             q_img  = q_name2img.get(qn, qn)
-            q_node_vec = (q_node_mat[qi] if q_node_mat is not None else None)
 
             if flag == "seq_wire":
                 # --- 1) 先備妥 Node Sequence 的 2D 投影向量（一次建好快取，避免重算） ---
                 # if 'Q_SEQ_XY_CACHE' not in globals():
                 #     global Q_SEQ_XY_CACHE, C_SEQ_XY_CACHE
-                Q_SEQ_XY_CACHE = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
-                C_SEQ_XY_CACHE = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
 
                 q_seq_xy = Q_SEQ_XY_CACHE[qi]
                 Nc = len(C_SEQ_XY_CACHE)
@@ -788,20 +821,48 @@ def main():
                 idxs = part[order]
                 scores = fused[idxs].astype(np.float32)
 
-                top1 = int(idxs[0])
+                # ========= 這裡開始：用 GlueStick / ORB 對 top-10 做 re-ranking =========
+                # 取得 query 的實際影像路徑
+                q_img_path = _resolve_img_path(q_names[qi], args.query_root)
+
+                glue_topk = min(10, len(idxs))  # 只對前 10 名候選做 image matching
+                glue_candidates = idxs[:glue_topk]
+
+                glue_best_idx = None
+                glue_best_count = -1
+
+                for ci in glue_candidates:
+                    cn = c_names[ci]
+                    cand_img_path = _resolve_img_path(cn, args.candidate_root)
+                    n_matches = count_gluestick_matches(q_img_path, cand_img_path)
+                    # 你可以在這裡加 debug print 看每張 match 數量
+                    # print(f"[GlueStick] {q_names[qi]} vs {cn}: {n_matches} matches")
+                    if n_matches > glue_best_count:
+                        glue_best_count = n_matches
+                        glue_best_idx = int(ci)
+
+                # 如果 GlueStick / ORB 完全失敗，就 fallback 到原本 fused 的 top-1
+                if glue_best_idx is None:
+                    glue_best_idx = int(idxs[0])
+                    glue_best_count = 0
+
+                # 只保留 GlueStick re-rank 後的 top-1，方便後面統一處理
+                idxs = np.array([glue_best_idx], dtype=int)
+                scores = np.array([fused[glue_best_idx]], dtype=np.float32)
 
                 print("\n========== [DEBUG layout] ==========")
-                print(f"Query image: {q_names[qi]}")
-                print(f"Top-1 cand : {c_names[top1]}")
+                print(f"Query image        : {q_names[qi]}")
+                print(f"Top-1 cand (Graph) : {c_names[order[0]]}")
+                print(f"Top-1 cand (Glue)  : {c_names[glue_best_idx]}  (#matches={glue_best_count})")
             else:
                 raise ValueError(f"Unknown viz_flag: {flag}")
             
             # 名稱→索引
-            cand_name2idx = {name:i for i,name in enumerate(c_names)}
-            for i,name in enumerate(c_names):
+            cand_name2idx = {name: i for i, name in enumerate(c_names)}
+            for i, name in enumerate(c_names):
                 cand_name2idx[Path(name).name] = i
 
-            # 整理輸出 rows
+            # 這時候 idxs 只剩 GlueStick re-rank 後的 top-1
             rows = []
             scores_map = {int(i): float(s) for i, s in zip(idxs, scores)}
 
@@ -810,11 +871,14 @@ def main():
                 row = {
                     "rank": r,
                     "name": cn,
-                    "score": float(scores[r-1]) if r-1 < len(scores) else None,
-                    "path": c_name2img.get(cn, cn)
+                    "score": scores_map.get(int(ci), None),
+                    "path": c_name2img.get(cn, cn),
+                    # 把 GlueStick / ORB 的 matching 數量寫進 JSON
+                    "gluestick_matches": int(glue_best_count),
                 }
-
                 rows.append(row)
+
+            # ★ 每個 query 只留一筆（top-1）結果
             results[qn] = rows
 
 

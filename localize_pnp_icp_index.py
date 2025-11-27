@@ -157,49 +157,6 @@ def load_pairs_topk(path: str, topk: int = 10) -> List[Tuple[str, str]]:
     return pairs
 
 
-# def load_pairs_top1(path: str) -> List[Tuple[str, str]]:
-#     """Parse pairs JSON, return list of (real, synth_top1)."""
-#     with open(path, "r", encoding="utf-8") as f:
-#         obj = json.load(f)
-#     pairs: List[Tuple[str, str]] = []
-#     def push(real, synth):
-#         if real and synth:
-#             pairs.append((str(real), str(synth)))
-#     if isinstance(obj, dict):
-#         if "results" in obj:
-#             for rname, arr in obj["results"].items():
-#                 if isinstance(arr, list) and len(arr) > 0:
-#                     ref = arr[0]
-#                     if isinstance(ref, dict) and "ref_image" in ref:
-#                         push(rname, ref["ref_image"])
-#                     elif isinstance(ref, str):
-#                         push(rname, ref)
-#         elif "pairs" in obj and isinstance(obj["pairs"], list):
-#             # [{"real_image": ..., "synth_image": ...}, ...]
-#             for it in obj["pairs"]:
-#                 if isinstance(it, dict):
-#                     r = it.get("real") or it.get("real_image") or it.get("query")
-#                     s = it.get("synthetic") or it.get("synth_image") or (it.get("top_k")[0] if isinstance(it.get("top_k"), list) and it.get("top_k") else None)
-#                     push(r, s)
-#         else:
-#             # direct map {real: [refs]} or {real: synth}
-#             for k, v in obj.items():
-#                 if isinstance(v, list) and v:
-#                     vv = v[0]
-#                     push(k, vv["ref_image"] if isinstance(vv, dict) and "ref_image" in vv else vv)
-#                 elif isinstance(v, str):
-#                     push(k, v)
-#     elif isinstance(obj, list):
-#         for it in obj:
-#             if isinstance(it, dict):
-#                 r = it.get("real") or it.get("real_image") or it.get("query")
-#                 s = it.get("synthetic") or it.get("synth_image")
-#                 push(r, s)
-#     if not pairs:
-#         raise ValueError("No pairs found in pairs JSON (top-1).")
-#     return pairs
-
-
 # ==============================
 # GlueStick pipeline + PnP (single pair, top-1 reference)
 # ==============================

@@ -25,10 +25,13 @@ from PIL import Image
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='HAWP Inference')
+    
     parser.add_argument('config', help='Path to the config file')
     parser.add_argument("--ckpt", type=str, required=True, help="Path to the checkpoint file")
-    parser.add_argument("--imagedir", type=str, required=True,
+    parser.add_argument("--imagedir", type=str, default=None,
                         help="Directory containing images for inference")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Single image path for inference")
     parser.add_argument("--j2l", default=None, type=float, help='Threshold for junction-line attraction')
     parser.add_argument("--jhm", default=None, type=float, help='Threshold for junction heatmap')
     parser.add_argument("--rscale", default=2, type=int, help='Residual scale')
@@ -70,14 +73,30 @@ if __name__ == "__main__":
     # Build image transformation
     transform = build_transform(cfg)
 
-    # List image files from the provided image directory
+    # 決定要用「單張圖片」還是「資料夾」模式
     image_extensions = ['.jpg', '.jpeg', '.png']
-    image_files = [osp.join(args.imagedir, f) for f in os.listdir(args.imagedir)
-                   if osp.splitext(f)[1].lower() in image_extensions]
-    if not image_files:
-        print("No images found in the directory:", args.imagedir)
-        exit(0)
-    
+
+    if args.image is not None:
+        # 單張圖片模式
+        ext = osp.splitext(args.image)[1].lower()
+        if ext not in image_extensions:
+            print("Provided --image is not a supported format:", args.image)
+            exit(1)
+        image_files = [args.image]
+    elif args.imagedir is not None:
+        # 資料夾模式（跟原本一樣）
+        image_files = [
+            osp.join(args.imagedir, f)
+            for f in os.listdir(args.imagedir)
+            if osp.splitext(f)[1].lower() in image_extensions
+        ]
+        if not image_files:
+            print("No images found in the directory:", args.imagedir)
+            exit(0)
+    else:
+        print("You must specify either --image or --imagedir")
+        exit(1)
+
     logger = setup_logger('hawp.inference', root)
     logger.info("Running inference on {} images".format(len(image_files)))
     
