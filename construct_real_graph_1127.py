@@ -28,7 +28,7 @@ OUTPUT_JSON_REAL = Path("/D/lulu/Delta/graph/readingRoom/readingRoom_graph_real_
 OUTPUT_VIS_REAL  = Path("/D/lulu/Delta/graph/readingRoom/vis_single/")
 DEPTH_FOLDER     = Path("/D/lulu/Delta/Image_data/depth_maps/readingRoom_depth_single/")
 CAMERA_INTRINSICS = np.array([1649.5450819708324, 1649.719272635186, 1200.0,  673.5], dtype=float)
-
+REAL_DEPTH_TMP = Path(r"C:\Users\User\Image_Localization\tmp\depth")
 
 STRUCTURAL_CLASSES = [
     "Walls", "Columns", "Beams", "Ceilings", "Floors", "Doors", "Windows", "Pipe", "Cable_Tray"
@@ -62,7 +62,7 @@ _base_rules = {
 
 # === 單張模式：YOLO + Depth Pro 模型初始化 ===
 # YOLO segmentation 權重檔，請改成你實際 best.pt 的路徑
-YOLO_WEIGHTS = Path("/D/lulu/home/Delta/graph/YOLO/best.pt")  # 例如 Path("/D/lulu/Delta/graph/best.pt")
+YOLO_WEIGHTS = Path(r"C:\Users\User\Delta_Dataset\best.pt")  # 例如 Path("/D/lulu/Delta/graph/best.pt")
 
 # 只初始化一次，之後重複拿來用
 _yolo_model = YOLO(str(YOLO_WEIGHTS))
@@ -75,7 +75,7 @@ def _create_depth_model_and_transform():
     """
     # 請把這個路徑改成你實際的 depth_pro.pt 位置
     # 例如：/home/lulu/ml-depth-pro/checkpoints/depth_pro.pt
-    ckpt_path = "/D/lulu/home/ml-depth-pro/checkpoints/depth_pro.pt"
+    ckpt_path = r"C:\Users\User\Delta_Dataset\depth_pro.pt"
 
     config = DepthProConfig(
         patch_encoder_preset="dinov2l16_384",
@@ -202,6 +202,14 @@ def build_real_graph_single_image(image_path: Union[str, Path],
 
     rgb = cv2.resize(rgb_orig, target_size, interpolation=cv2.INTER_LINEAR)
     depth_resized = cv2.resize(depth_np, target_size, interpolation=cv2.INTER_NEAREST)
+
+    try:
+        REAL_DEPTH_TMP.mkdir(parents=True, exist_ok=True)
+        depth_out_path = REAL_DEPTH_TMP / f"{image_path.stem}.npy"
+        np.save(depth_out_path, depth_resized.astype(np.float32))
+        print(f"[depth] Saved real depth for {image_path.name} to {depth_out_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to save real depth for {image_path.name}: {e}")
 
     dmin, dmax = float(depth_resized.min()), float(depth_resized.max())
     depth_norm = (depth_resized - dmin) / (dmax - dmin + 1e-6)

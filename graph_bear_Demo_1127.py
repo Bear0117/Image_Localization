@@ -8,6 +8,11 @@ import numpy as np
 import csv
 import cv2
 
+import torch
+from gluestick import GLUESTICK_ROOT, batch_to_np, numpy_image_to_torch
+from gluestick.models.two_view_pipeline import TwoViewPipeline
+from SuperGluePretrainedNetwork.models.utils import read_image
+
 
 import os
 from networkx.algorithms.similarity import optimize_edit_paths
@@ -330,39 +335,148 @@ def chi2_to_similarity(d: np.ndarray, tau: float) -> np.ndarray:
     x = np.clip(d / tau, 0.0, 50.0)           # 50 對 float32 夠保守（exp(-50)≈1.9e-22）
     return np.exp(-x, dtype=np.float64).astype(np.float32)
 
+# ---------------- GlueStick pipeline (for re-rank) ----------------
+_GS_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_GS_PIPE = None
+
+def create_gs_pipeline(dev: str) -> TwoViewPipeline:
+    """Create GlueStick two-view pipeline (same config as localize_pnp_icp_index.py)."""
+    cfg = {
+        "name": "two_view_pipeline",
+        "use_lines": True,
+
+        "extractor": {
+            "name": "wireframe",
+
+            # -------- SuperPoint 相關 --------
+            "sp_params": {
+                "force_num_keypoints": True,
+                "max_num_keypoints": 2000,
+            },
+
+            # -------- Wireframe 相關 --------
+            "wireframe_params": {
+                "merge_points": True,
+                "merge_line_endpoints": True,
+                "nms_radius": 2,
+            },
+
+            "max_n_lines": 400,
+        },
+
+        "matcher": {
+            "name": "gluestick",
+            "weights": str(GLUESTICK_ROOT / "resources/weights/checkpoint_GlueStick_MD.tar"),
+            "trainable": False,
+        },
+
+        "ground_truth": {"from_pose_depth": False},
+    }
+    return TwoViewPipeline(cfg).to(dev).eval()
+
+
+def _get_gs_pipeline() -> TwoViewPipeline:
+    global _GS_PIPE
+    if _GS_PIPE is None:
+        print(f"[GlueStick] Initializing two-view pipeline on device: {_GS_DEVICE}")
+        _GS_PIPE = create_gs_pipeline(_GS_DEVICE)
+    return _GS_PIPE
+
 def count_gluestick_matches(query_img_path: str, cand_img_path: str) -> int:
     """
-    預設用 OpenCV ORB 當作 placeholder，回傳 local feature matches 的數量。
-    若你已經有自己的 GlueStick pipeline，可以直接把這個函式內容換成：
-      - 呼叫 GlueStick
-      - 讀出 matches
-      - 回傳 matches 的數量（int）
+    使用 GlueStick two-view pipeline 計算兩張圖之間的 matching 數量。
+    實作方式與 localize_pnp_icp_index.py 中的 GlueStick 流程一致：
+    - read_image + numpy_image_to_torch
+    - pipe({"image0": syn, "image1": real})
+    - matches.shape[0] 當作 matching 數量
     """
-    img1 = cv2.imread(str(query_img_path), cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(str(cand_img_path), cv2.IMREAD_GRAYSCALE)
-    if img1 is None or img2 is None:
-        print(f"[warn] fail to read images for matching: {query_img_path}, {cand_img_path}")
+    device = _GS_DEVICE
+    pipe = _get_gs_pipeline()
+
+    # 與 localize_pnp_icp_index.py 一致的工作解析度
+    resize = (720, 540)  # (width, height)
+
+    # 讀圖 & resize（GlueStick 官方 util 會直接給符合 numpy_image_to_torch 期望的格式）
+    # 這裡不做灰階，保持 RGB，完全對齊 PnP 程式
+    try:
+        q_img, _, _ = read_image(
+            str(query_img_path),
+            device=device,
+            resize=resize,
+            rotation=0,
+            resize_float=resize,
+        )
+        c_img, _, _ = read_image(
+            str(cand_img_path),
+            device=device,
+            resize=resize,
+            rotation=0,
+            resize_float=resize,
+        )
+    except Exception as e:
+        print(f"[GlueStick] read_image failed for ({query_img_path}, {cand_img_path}): {e}")
         return 0
 
-    # ORB keypoints + BF matcher，僅作為 GlueStick 的佔位實作
-    orb = cv2.ORB_create(5000)
-    k1, d1 = orb.detectAndCompute(img1, None)
-    k2, d2 = orb.detectAndCompute(img2, None)
-    if d1 is None or d2 is None:
+    # 轉成 (B, C, H, W) tensor
+    try:
+        t_q = numpy_image_to_torch(q_img)[None].to(device)
+        t_c = numpy_image_to_torch(c_img)[None].to(device)
+    except Exception as e:
+        print(f"[GlueStick] numpy_image_to_torch failed: {e}")
         return 0
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    knn = bf.knnMatch(d1, d2, k=2)
+    # 跑 two-view pipeline
+    try:
+        out = batch_to_np(pipe({"image0": t_q, "image1": t_c}))
+    except Exception as e:
+        print(f"[GlueStick] pipeline forward failed: {e}")
+        return 0
 
-    good = 0
-    for m in knn:
-        if len(m) < 2:
-            continue
-        m1, m2 = m
-        if m1.distance < 0.75 * m2.distance:
-            good += 1
+    # 解析 matches（完全比照 localize_pnp_icp_index.py）
+    k0, k1, m0 = out["keypoints0"], out["keypoints1"], out["matches0"]
+    valid = m0 > -1
+    if valid.sum() > 0:
+        matches = np.stack([np.where(valid)[0], m0[valid]], axis=1)
+    else:
+        matches = np.empty((0, 2), dtype=int)
 
-    return good
+    num_matches = int(matches.shape[0])
+    # 這裡只需要 matching 數量來 re-rank，所以直接回傳
+    return num_matches
+
+
+
+# def count_gluestick_matches(query_img_path: str, cand_img_path: str) -> int:
+#     """
+#     使用 GlueStick two-view pipeline 計算兩張圖之間的 match 數量。
+#     回傳：有效 matches 的個數（int）。
+#     """
+#     # 讀 BGR，再轉成 RGB（GlueStick 用的是標準 RGB numpy）
+#     img_q_bgr = cv2.imread(str(query_img_path), cv2.IMREAD_COLOR)
+#     img_c_bgr = cv2.imread(str(cand_img_path), cv2.IMREAD_COLOR)
+#     if img_q_bgr is None or img_c_bgr is None:
+#         print(f"[warn] fail to read images for matching: {query_img_path}, {cand_img_path}")
+#         return 0
+
+#     img_q = cv2.cvtColor(img_q_bgr, cv2.COLOR_BGR2RGB)
+#     img_c = cv2.cvtColor(img_c_bgr, cv2.COLOR_BGR2RGB)
+
+#     pipe = _get_gs_pipeline()
+
+#     # 轉成 GlueStick 需要的 torch tensor (1,3,H,W), float32, 0~1
+#     t_q = numpy_image_to_torch(img_q)[None].to(_GS_DEVICE)
+#     t_c = numpy_image_to_torch(img_c)[None].to(_GS_DEVICE)
+
+#     with torch.no_grad():
+#         out = batch_to_np(pipe({"image0": t_q, "image1": t_c}))
+
+#     k0 = out["keypoints0"]
+#     matches0 = out["matches0"]  # 對應到 image1 的 index，-1 表示沒有 match
+
+#     valid = matches0 > -1
+#     num_matches = int(valid.sum())
+#     return num_matches
+
 
 
 def name2imgpath_from_graphs(names: List[str], graphs: List) -> Dict[str, str]:
@@ -772,7 +886,6 @@ def main():
         # 依旗標執行
         TOPK = 50
         results = {}
-        args._ref_map = mi_map
         Q_SEQ_XY_CACHE = build_seq_xy_batch(q_graphs, class_order, intrinsics="real")
         C_SEQ_XY_CACHE = build_seq_xy_batch(c_graphs, class_order, intrinsics="syn")
 
@@ -821,7 +934,7 @@ def main():
                 idxs = part[order]
                 scores = fused[idxs].astype(np.float32)
 
-                # ========= 這裡開始：用 GlueStick / ORB 對 top-10 做 re-ranking =========
+                # ========= 這裡開始：用 GlueStick 對 top-10 做 re-ranking =========
                 # 取得 query 的實際影像路徑
                 q_img_path = _resolve_img_path(q_names[qi], args.query_root)
 
@@ -873,7 +986,7 @@ def main():
                     "name": cn,
                     "score": scores_map.get(int(ci), None),
                     "path": c_name2img.get(cn, cn),
-                    # 把 GlueStick / ORB 的 matching 數量寫進 JSON
+                    # 把 GlueStick的 matching 數量寫進 JSON
                     "gluestick_matches": int(glue_best_count),
                 }
                 rows.append(row)
@@ -901,47 +1014,47 @@ def main():
 
             #---
             # [C-1] 取得這張 query 的 ref 名稱
-            q_canon = _canon_name(q_names[qi])
-            ref_canon = mi_map.get(q_canon, None)
+            # q_canon = _canon_name(q_names[qi])
+            # ref_canon = mi_map.get(q_canon, None)
 
-            # === 產生 ref_item（不重算，直接用當前候選 rows 的現成分數；不在 top-K 就顯示圖 + N/A） ===
-            ref_item = None
-            if ref_canon is not None:
-                # 1) 先在本張 query 的 top-K 候選 rows 裡找看看
-                matched_row = None
-                for row in rows:
-                    # rows[i]["name"] 可能是完整路徑或相對路徑，統一轉成 canon 後比對
-                    try:
-                        nm_canon = _canon_name(row.get("name", ""))
-                    except Exception:
-                        nm_canon = ""
-                    if nm_canon == ref_canon:
-                        matched_row = row
-                        break
+            # # === 產生 ref_item（不重算，直接用當前候選 rows 的現成分數；不在 top-K 就顯示圖 + N/A） ===
+            # ref_item = None
+            # if ref_canon is not None:
+            #     # 1) 先在本張 query 的 top-K 候選 rows 裡找看看
+            #     matched_row = None
+            #     for row in rows:
+            #         # rows[i]["name"] 可能是完整路徑或相對路徑，統一轉成 canon 後比對
+            #         try:
+            #             nm_canon = _canon_name(row.get("name", ""))
+            #         except Exception:
+            #             nm_canon = ""
+            #         if nm_canon == ref_canon:
+            #             matched_row = row
+            #             break
 
-                if matched_row is not None:
-                    ref_item = {
-                        "name": matched_row.get("name", "ref"),
-                        "path": matched_row.get("path", matched_row.get("name")),
-                        "score": matched_row.get("score"),   # 現成分數
-                        "pc_iou": matched_row.get("pc_iou")
-                    }
-                else:
-                    # 優先用 c_name2img 對應出可讀取的影像路徑；沒有就用 candidate_root/ref_canon.*
-                    ref_img_path = c_name2img.get(ref_canon)
-                    if (not ref_img_path) and args.candidate_root:
-                        for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-                            p = Path(args.candidate_root) / (ref_canon + ext)
-                            if p.exists():
-                                ref_img_path = str(p)
-                                break
+            #     if matched_row is not None:
+            #         ref_item = {
+            #             "name": matched_row.get("name", "ref"),
+            #             "path": matched_row.get("path", matched_row.get("name")),
+            #             "score": matched_row.get("score"),   # 現成分數
+            #             "pc_iou": matched_row.get("pc_iou")
+            #         }
+            #     else:
+            #         # 優先用 c_name2img 對應出可讀取的影像路徑；沒有就用 candidate_root/ref_canon.*
+            #         ref_img_path = c_name2img.get(ref_canon)
+            #         if (not ref_img_path) and args.candidate_root:
+            #             for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+            #                 p = Path(args.candidate_root) / (ref_canon + ext)
+            #                 if p.exists():
+            #                     ref_img_path = str(p)
+            #                     break
 
-                    ref_item = {
-                        "name": ref_canon,
-                        "path": ref_img_path if ref_img_path else ref_canon,
-                        "score": None,
-                        "pc_iou": None
-                    }
+            #         ref_item = {
+            #             "name": ref_canon,
+            #             "path": ref_img_path if ref_img_path else ref_canon,
+            #             "score": None,
+            #             "pc_iou": None
+            #         }
             #---
 
         # 額外輸出 MI-style JSON：query_image → [{"ref_image": candidate_image}, ...]

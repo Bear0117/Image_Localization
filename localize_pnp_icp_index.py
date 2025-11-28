@@ -101,34 +101,65 @@ def transform_points_h(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
 # ==============================
 
 def read_pose_csv(path: str, translation_in_cm: bool = True) -> Dict[str, np.ndarray]:
-    """Read pose CSV into dict: image_key -> T_world_cam (4x4, meters).
-    Expected headers: [Camera Name, t_x, t_y, t_z, q_w, q_x, q_y, q_z]
-    Keys are stored as '<Camera Name>_rgb_image.png' to match synth file names.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Pose CSV not found: {path}")
-    pose_map: Dict[str, np.ndarray] = {}
+    pose_map = {}
+
     with open(path, "r", encoding="utf-8") as f:
         rdr = csv.DictReader(f)
         for r in rdr:
-            name = (r.get("Camera Name") or r.get("image") or r.get("filename") or "").strip()
-            if not name:
+            # 1) 取 name/path
+            name_raw = (r.get("name") or r.get("Camera Name") or r.get("image") or "").strip()
+            if not name_raw:
                 continue
-            tx = float(r.get("t_x") or r.get("tx") or r.get("x") or 0.0)
-            ty = float(r.get("t_y") or r.get("ty") or r.get("y") or 0.0)
-            tz = float(r.get("t_z") or r.get("tz") or r.get("z") or 0.0)
-            qw = float(r.get("q_w") or r.get("qw") or 1.0)
-            qx = float(r.get("q_x") or r.get("qx") or 0.0)
-            qy = float(r.get("q_y") or r.get("qy") or 0.0)
-            qz = float(r.get("q_z") or r.get("qz") or 0.0)
-            t = np.array([tx, ty, tz], dtype=np.float64)
+
+            # 2) 正規化成 <base>_rgb_image.png
+            base = os.path.basename(name_raw)
+            base, _ext = os.path.splitext(base)
+            if base.endswith("_rgb_image"):
+                base = base[:-len("_rgb_image")]
+            key = f"{base}_rgb_image.png"
+
+            # 3) 讀 transform_0 ~ transform_15
+            vals = [float(r[f"transform_{i}"]) for i in range(16)]
+            T = np.array(vals, dtype=np.float64).reshape(4, 4)
+
+            # 若 translation 是 cm → m
             if translation_in_cm:
-                t = t * 0.01  # cm -> m
-            R = quat_wxyz_to_rotm(qw, qx, qy, qz)
-            T = se3_from_rt(R, t)
-            key = f"{name}_rgb_image.png"  # match synth filenames
+                T[:3, 3] *= 0.01
+
             pose_map[key] = T
+
     return pose_map
+
+
+# def read_pose_csv(path: str, translation_in_cm: bool = True) -> Dict[str, np.ndarray]:
+#     """Read pose CSV into dict: image_key -> T_world_cam (4x4, meters).
+#     Expected headers: [Camera Name, t_x, t_y, t_z, q_w, q_x, q_y, q_z]
+#     Keys are stored as '<Camera Name>_rgb_image.png' to match synth file names.
+#     """
+#     if not os.path.exists(path):
+#         raise FileNotFoundError(f"Pose CSV not found: {path}")
+#     pose_map: Dict[str, np.ndarray] = {}
+#     with open(path, "r", encoding="utf-8") as f:
+#         rdr = csv.DictReader(f)
+#         for r in rdr:
+#             name = (r.get("Camera Name") or r.get("image") or r.get("filename") or "").strip()
+#             if not name:
+#                 continue
+#             tx = float(r.get("t_x") or r.get("tx") or r.get("x") or 0.0)
+#             ty = float(r.get("t_y") or r.get("ty") or r.get("y") or 0.0)
+#             tz = float(r.get("t_z") or r.get("tz") or r.get("z") or 0.0)
+#             qw = float(r.get("q_w") or r.get("qw") or 1.0)
+#             qx = float(r.get("q_x") or r.get("qx") or 0.0)
+#             qy = float(r.get("q_y") or r.get("qy") or 0.0)
+#             qz = float(r.get("q_z") or r.get("qz") or 0.0)
+#             t = np.array([tx, ty, tz], dtype=np.float64)
+#             if translation_in_cm:
+#                 t = t * 0.01  # cm -> m
+#             R = quat_wxyz_to_rotm(qw, qx, qy, qz)
+#             T = se3_from_rt(R, t)
+#             key = f"{name}_rgb_image.png"  # match synth filenames
+#             pose_map[key] = T
+#     return pose_map
 
 def load_pairs_topk(path: str, topk: int = 10) -> List[Tuple[str, str]]:
     """Parse pairs JSON, return list of (real, synth_ref) for the first K refs per real.
@@ -745,8 +776,8 @@ def main():
     ap.add_argument("--depth_trunc", type=float, default=40.0)
     ap.add_argument("--voxel_size", type=float, default=0.01)
     ap.add_argument("--vis", action="store_true", help="Save PNG visualizations for PnP matches and ICP before/after.")
-    ap.add_argument("--neighbor_rot_deg", type=float, default=90.0,help="鄰近影像旋轉差閾值 (deg)")
-    ap.add_argument("--neighbor_dist_m", type=float, default=3.0,help="鄰近影像位置差閾值 (m)")
+    ap.add_argument("--neighbor_rot_deg", type=float, default=30.0,help="鄰近影像旋轉差閾值 (deg)")
+    ap.add_argument("--neighbor_dist_m", type=float, default=1.0,help="鄰近影像位置差閾值 (m)")
     ap.add_argument("--neighbor_name_prefixes", nargs="+", default=None,help="僅納入檔名開頭符合任一前綴的合成影像（可選）")
     ap.add_argument("--junction_json", type=str, default=None,help="結構點 JSON（可選，用於在 real 圖上做像素級篩選）")
     ap.add_argument("--junction_tol_px", type=float, default=10.0,help="junction 像素容許誤差半徑")
@@ -782,7 +813,7 @@ def main():
         with open(args.real_gt_csv, "r", encoding="utf-8") as f:
             rdr = csv.DictReader(f)
             for r in rdr:
-                name = (r.get("Camera Name") or r.get("image") or "").strip()
+                name = (r.get("Camera Name") or r.get("image") or "name").strip()
                 if not name: 
                     continue
                 tx = float(r.get("t_x") or r.get("tx") or 0.0) * 0.01
@@ -833,8 +864,17 @@ def main():
         for idx, (real_name, synth_name) in enumerate(pairs):
             # real_path = Path(args.real_rgb_dir) / (os.path.basename(real_name) if not os.path.isabs(real_name) else os.path.basename(real_name))
             # synth_path = Path(args.synth_rgb_dir) / (os.path.basename(synth_name) if not os.path.isabs(synth_name) else os.path.basename(synth_name))
-            real_path  = Path(real_name)  if os.path.isabs(real_name)  else Path(args.real_rgb_dir)  / real_name
-            synth_path = Path(synth_name) if os.path.isabs(synth_name) else Path(args.synth_rgb_dir) / synth_name
+            real_base  = os.path.basename(str(real_name))
+            synth_base = os.path.basename(str(synth_name))
+
+            # real：永遠用 --real_rgb_dir + 檔名
+            real_path  = Path(args.real_rgb_dir) / real_base
+
+            # synth：如果 pairs_json 已經給絕對路徑就直接用；否則用 --synth_rgb_dir + 檔名
+            if os.path.isabs(synth_name):
+                synth_path = Path(synth_name)
+            else:
+                synth_path = Path(args.synth_rgb_dir) / synth_base
 
             # Base pose from top-1 synthetic
             synth_key = os.path.basename(str(synth_path))
@@ -913,6 +953,15 @@ def main():
             else:
                 init_source = "base"
 
+            # ---- 初始化 ICP 相關變數（先假設沒有 ICP，就直接用 T_init） ----
+            fitness = float("nan")
+            rmse = float("nan")
+            delta_icp = 0.0
+            rot_icp_deg = float("nan")
+            refined = False
+            fallback = ""
+            T_final = T_init.copy()
+
             # Stage-2 ICP
             # Real depth
             # Expect real depth file: <real_name>.npy or .png under real_depth_dir (meters)
@@ -927,82 +976,90 @@ def main():
             for c in cand:
                 if c.exists():
                     real_depth_p = c; break
+
             if real_depth_p is None:
-                print(f"[WARN] Missing real depth for {rp_base}; skip ICP")
-                continue
-            # Real depth
-            d_real = load_depth_any(real_depth_p)
-            H_r, W_r = d_real.shape[:2]
-            frx, fry, frcx, frcy = scale_intrinsics(
-                float(K_real[0,0]), float(K_real[1,1]), float(K_real[0,2]), float(K_real[1,2]),
-                base_w=720, base_h=540, img_w=W_r, img_h=H_r  # 這裡 base_w,h 要放 K_real 對應的基準尺寸
-            )
-            real_pts_cv = depth_to_points_opencv(d_real, frx, fry, frcx, frcy, stride=args.stride, trunc=args.depth_trunc)
-            # to correct units.
-            # real_pts_cv *= 5.0
-            real_pts_usd = cv_to_usd(real_pts_cv)
+                # 沒有真實深度：不跑 ICP，保留 T_init，並標註 fallback
+                print(f"[WARN] Missing real depth for {rp_base}; use PnP/base pose without ICP.")
+                fallback = "no_real_depth"
+            else:
+                # ==== 以下整段「Real depth → Synth depth → ICP → Visualization」全部往右縮排一層，放進這個 else 裡 ====
 
-            # Synth depth
-            d_synth = load_depth_any(depth_path_for(Path(args.synth_depth_dir), synth_key))
-            H_s, W_s = d_synth.shape[:2]
-            fsx, fsy, fscx, fscy = scale_intrinsics(
-                float(K_syn[0,0]), float(K_syn[1,1]), float(K_syn[0,2]), float(K_syn[1,2]),
-                base_w=720, base_h=540, img_w=W_s, img_h=H_s  # 同上，基於 K_syn 的基準
-            )
-            synth_pts_cv = depth_to_points_opencv(d_synth, fsx, fsy, fscx, fscy, stride=args.stride, trunc=args.depth_trunc)
-            # to correct units.
-            # synth_pts_cv *= 5.0
-            synth_pts_usd = cv_to_usd(synth_pts_cv)
-            synth_pts_world = transform_points_h(T_base, synth_pts_usd)
+                # Real depth
+                d_real = load_depth_any(real_depth_p)
+                H_r, W_r = d_real.shape[:2]
+                frx, fry, frcx, frcy = scale_intrinsics(
+                    float(K_real[0, 0]), float(K_real[1, 1]),
+                    float(K_real[0, 2]), float(K_real[1, 2]),
+                    base_w=720, base_h=540, img_w=W_r, img_h=H_r
+                )
+                real_pts_cv = depth_to_points_opencv(
+                    d_real, frx, fry, frcx, frcy,
+                    stride=args.stride, trunc=args.depth_trunc
+                )
+                # real_pts_cv *= 5.0
+                real_pts_usd = cv_to_usd(real_pts_cv)
 
+                # Synth depth
+                d_synth = load_depth_any(depth_path_for(Path(args.synth_depth_dir), synth_key))
+                H_s, W_s = d_synth.shape[:2]
+                fsx, fsy, fscx, fscy = scale_intrinsics(
+                    float(K_syn[0, 0]), float(K_syn[1, 1]),
+                    float(K_syn[0, 2]), float(K_syn[1, 2]),
+                    base_w=720, base_h=540, img_w=W_s, img_h=H_s
+                )
+                synth_pts_cv = depth_to_points_opencv(
+                    d_synth, fsx, fsy, fscx, fscy,
+                    stride=args.stride, trunc=args.depth_trunc
+                )
+                # synth_pts_cv *= 5.0
+                synth_pts_usd = cv_to_usd(synth_pts_cv)
+                synth_pts_world = transform_points_h(T_base, synth_pts_usd)
 
+                # ---- Save pre-ICP point clouds in OpenCV camera coordinates ----
+                if args.save_ply:
+                    # real: OpenCV camera coords
+                    if real_pts_cv.size > 0:
+                        # real_pts_cv *= 3.281  # to feet
+                        pcd_real_cv = make_o3d_pcd(real_pts_cv)  # 直接用 CV 座標，勿轉換
+                        o3d.io.write_point_cloud(str(out_ply_dir / f"{rp_stem}__real_cv.ply"), pcd_real_cv)
 
-            # ---- Save pre-ICP point clouds in OpenCV camera coordinates (no world/USB transform) ----
-            if args.save_ply:
-                # real: OpenCV camera coords
-                if real_pts_cv.size > 0:
-                    # real_pts_cv *= 3.281  # to feet
-                    pcd_real_cv = make_o3d_pcd(real_pts_cv)  # 直接用 CV 座標，勿轉換
-                    o3d.io.write_point_cloud(str(out_ply_dir / f"{rp_stem}__real_cv.ply"), pcd_real_cv)
+                    # synth (Top-1): OpenCV camera coords
+                    synth_stem = os.path.splitext(os.path.basename(str(synth_path)))[0]
+                    if synth_pts_cv.size > 0:
+                        # synth_pts_cv *= 3.281  # to feet
+                        pcd_synth_cv = make_o3d_pcd(synth_pts_cv)  # 直接用 CV 座標，勿轉換
+                        o3d.io.write_point_cloud(str(out_ply_dir / f"{rp_stem}__{synth_stem}__synth_cv.ply"), pcd_synth_cv)
 
-                # synth (Top-1): OpenCV camera coords
-                synth_stem = os.path.splitext(os.path.basename(str(synth_path)))[0]
-                if synth_pts_cv.size > 0:
-                    # synth_pts_cv *= 3.281  # to feet
-                    pcd_synth_cv = make_o3d_pcd(synth_pts_cv)  # 直接用 CV 座標，勿轉換
-                    o3d.io.write_point_cloud(str(out_ply_dir / f"{rp_stem}__{synth_stem}__synth_cv.ply"), pcd_synth_cv)
+                # ICP multi-stage
+                T_icp, fitness, rmse = global_register_fpfh(
+                    real_pts_usd, synth_pts_world, T_init,
+                    max_corr_list=[0.30, 0.20, 0.10, 0.05],
+                    max_iter=50, voxel=args.voxel_size
+                )
+                delta_icp = se3_distance_t(T_icp, T_init)
+                rot_icp_deg = rotation_error_deg(T_icp[:3, :3], T_init[:3, :3])
 
+                pass_quality = (delta_icp <= args.icp_max_jump_m) and \
+                               (fitness >= args.min_fitness) and \
+                               (rmse <= args.max_rmse)
+                refined = bool(pass_quality)
+                fallback = ""
+                T_final = T_icp if pass_quality else T_init
+                if not pass_quality:
+                    fallback = f"icp_guard(delta={delta_icp:.2f}, fitness={fitness:.3f}, rmse={rmse:.3f})"
+                
+                # Visualization
+                if args.vis:
+                    # before ICP
+                    src_init_pts = transform_points_h(T_init, real_pts_usd)
+                    src_init = make_o3d_pcd(src_init_pts);  src_init.paint_uniform_color([0.60, 0.80, 1.00])  # 淺藍
+                    tgt = make_o3d_pcd(synth_pts_world);    tgt.paint_uniform_color([0.70, 0.90, 0.70])        # 淺綠
+                    render_geoms_png([src_init, tgt], Path(args.out_dir) / f"{rp_stem}_icp_before.png")
 
-
-            # ICP multi-stage
-            # T_icp, fitness, rmse = icp_register_point_to_plane(
-            #     real_pts_usd, synth_pts_world, T_init, max_corr_list=[0.30, 0.20, 0.10, 0.05], max_iter=50, voxel=args.voxel_size
-            # )
-            T_icp, fitness, rmse = global_register_fpfh(
-                real_pts_usd, synth_pts_world, T_init, max_corr_list=[0.30, 0.20, 0.10, 0.05], max_iter=50, voxel=args.voxel_size
-            )
-            delta_icp = se3_distance_t(T_icp, T_init)
-            rot_icp_deg = rotation_error_deg(T_icp[:3, :3], T_init[:3, :3])
-
-            pass_quality = (delta_icp <= args.icp_max_jump_m) and (fitness >= args.min_fitness) and (rmse <= args.max_rmse)
-            refined = bool(pass_quality)
-            fallback = ""
-            T_final = T_icp if pass_quality else T_init
-            if not pass_quality:
-                fallback = f"icp_guard(delta={delta_icp:.2f}, fitness={fitness:.3f}, rmse={rmse:.3f})"
-
-            # Visualization
-            if args.vis:
-                # before ICP
-                src_init_pts = transform_points_h(T_init, real_pts_usd)
-                src_init = make_o3d_pcd(src_init_pts);  src_init.paint_uniform_color([0.60, 0.80, 1.00])  # 淺藍
-                tgt = make_o3d_pcd(synth_pts_world);    tgt.paint_uniform_color([0.70, 0.90, 0.70])        # 淺綠
-                render_geoms_png([src_init, tgt], Path(args.out_dir) / f"{rp_stem}_icp_before.png")
-
-                # after ICP (or fallback to init if guard fails)
-                src_final_pts = transform_points_h(T_final, real_pts_usd)
-                src_final = make_o3d_pcd(src_final_pts); src_final.paint_uniform_color([0.60, 0.80, 1.00]) # 淺藍
-                render_geoms_png([src_final, tgt], Path(args.out_dir) / f"{rp_stem}_icp_after.png")
+                    # after ICP (or fallback to init if guard fails)
+                    src_final_pts = transform_points_h(T_final, real_pts_usd)
+                    src_final = make_o3d_pcd(src_final_pts); src_final.paint_uniform_color([0.60, 0.80, 1.00]) # 淺藍
+                    render_geoms_png([src_final, tgt], Path(args.out_dir) / f"{rp_stem}_icp_after.png")            
 
             # Optionally compute errors vs GT
             # Optionally compute errors vs GT
